@@ -4,8 +4,8 @@ from security_ai.storage import save_gallery, load_gallery, safe_profile_name, i
 
 def test_gallery_roundtrip(tmp_path):
     p = tmp_path / "gallery.npz"
-    save_gallery(p, {"alice": [np.array([1.,0.])]})
-    assert np.allclose(load_gallery(p)["alice"][0], [1.,0.])
+    save_gallery(p, {"alice": [np.array([1.0, 0.0])]})
+    assert np.allclose(load_gallery(p)["alice"][0], [1.0, 0.0])
 
 
 def test_profile_validation():
