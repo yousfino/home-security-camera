@@ -10,6 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .capture import LatestFrameCapture
 from .config import RecognitionConfig, positive_int, finite_float
 from .core import normalized
 from .detection import YoloPersonDetector
@@ -51,13 +52,19 @@ def enroll(args: argparse.Namespace, gallery_path: Path) -> None:
     if name in gallery and not args.replace:
         raise ValueError("Profile exists; use --replace to explicitly replace it")
     samples: list[np.ndarray] = []
-    cap = camera(args.camera, args.width, args.height)
+    cap = LatestFrameCapture(
+        lambda: camera(args.camera, args.width, args.height), max_attempts=args.reconnect_attempts
+    ).start()
     print("Enrollment: one consenting person; SPACE captures a sample, Q cancels.")
     try:
         while len(samples) < args.samples:
-            ok, frame = cap.read()
-            if not ok:
-                time.sleep(0.1)
+            packet = cap.read()
+            if packet is None:
+                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                    break
+                continue
+            frame = packet.image
+            if time.monotonic() - packet.acquired_at > args.max_frame_age:
                 continue
             faces = model.detect(frame)
             ready = len(faces) == 1 and quality_ok(frame, faces[0])
@@ -88,8 +95,10 @@ def enroll(args: argparse.Namespace, gallery_path: Path) -> None:
                 else:
                     samples.append(sample)
     finally:
-        cap.release()
-        cv2.destroyAllWindows()
+        try:
+            cap.close()
+        finally:
+            cv2.destroyAllWindows()
     if len(samples) != args.samples:
         print("Enrollment incomplete; nothing saved")
         return
@@ -110,17 +119,26 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
         detector, PersonTracker(args.track_max_age), model, gallery, recognition_config(args)
     )
     init_db(db_path)
-    cap = camera(args.camera, args.width, args.height)
+    cap = LatestFrameCapture(
+        lambda: camera(args.camera, args.width, args.height), max_attempts=args.reconnect_attempts
+    ).start()
     display = HeadlessDisplay() if args.headless else OpenCVDisplay("Home Security Camera")
     frames = 0
+    generation = None
     try:
         while args.max_frames is None or frames < args.max_frames:
-            ok, frame = cap.read()
-            if not ok:
-                pipeline.reset()
-                time.sleep(0.2)
+            packet = cap.read()
+            if packet is None:
+                if not args.headless and cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                    break
                 continue
-            timestamp = time.monotonic()
+            if packet.generation != generation:
+                pipeline.reset()
+                generation = packet.generation
+            frame, timestamp = packet.image, packet.acquired_at
+            if time.monotonic() - timestamp > args.max_frame_age:
+                pipeline.reset()
+                continue
             decisions = pipeline.process(frame, timestamp)
             for decision in decisions:
                 if decision.emit:
@@ -149,11 +167,22 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
                     1,
                 )
             frames += 1
+            if args.metrics and frames % 30 == 0:
+                print(
+                    {
+                        **pipeline.timings,
+                        "frame_age_ms": (time.monotonic() - timestamp) * 1000,
+                        "dropped_frames": cap.dropped,
+                        "reconnects": cap.reconnects,
+                    }
+                )
             if not display.show(preview):
                 break
     finally:
-        cap.release()
-        display.close()
+        try:
+            cap.close()
+        finally:
+            display.close()
 
 
 def list_events(db_path: Path) -> None:
@@ -171,6 +200,7 @@ def list_events(db_path: Path) -> None:
 def recognition_config(args: argparse.Namespace) -> RecognitionConfig:
     return RecognitionConfig(
         threshold=args.threshold,
+        recognition_interval=args.recognition_interval,
         evidence_ttl=args.evidence_ttl,
         ambiguity_margin=args.ambiguity_margin,
         cooldown=args.cooldown,
@@ -185,6 +215,8 @@ def main() -> None:
     for command in ("enroll", "monitor"):
         p = sub.add_parser(command)
         p.add_argument("--camera", type=int, default=0)
+        p.add_argument("--reconnect-attempts", type=positive_int, default=8)
+        p.add_argument("--max-frame-age", type=finite_float, default=0.5)
         p.add_argument("--width", type=positive_int, default=640)
         p.add_argument("--height", type=positive_int, default=480)
         p.add_argument("--det-size", type=positive_int, default=640)
@@ -221,10 +253,14 @@ def main() -> None:
             p.add_argument("--cooldown", type=finite_float, default=30.0)
             p.add_argument("--familiar-log-interval", type=finite_float, default=60.0)
             p.add_argument("--headless", action="store_true")
+            p.add_argument("--metrics", action="store_true")
+            p.add_argument("--recognition-interval", type=finite_float, default=0.2)
             p.add_argument("--max-frames", type=positive_int)
     sub.add_parser("events")
     args = parser.parse_args()
     try:
+        if args.command in ("monitor", "enroll") and args.max_frame_age <= 0:
+            raise ValueError("Maximum frame age must be positive")
         if args.command == "monitor":
             recognition_config(args)
             if args.track_max_age <= 0 or not 0 < args.person_confidence <= 1:

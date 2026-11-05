@@ -27,6 +27,7 @@ class RecognitionConfig:
     window: int = 5
     evidence_ttl: float = 2.0
     ambiguity_margin: float = 0.05
+    recognition_interval: float = 0.2
     cooldown: float = 30.0
     familiar_log_interval: float = 60.0
 
@@ -35,7 +36,13 @@ class RecognitionConfig:
             raise ValueError("Cosine threshold must be finite and in [-1, 1]")
         if not 1 <= self.minimum <= self.window:
             raise ValueError("Require 1 <= minimum <= window")
-        for name in ("evidence_ttl", "ambiguity_margin", "cooldown", "familiar_log_interval"):
+        for name in (
+            "evidence_ttl",
+            "ambiguity_margin",
+            "recognition_interval",
+            "cooldown",
+            "familiar_log_interval",
+        ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")

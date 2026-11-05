@@ -34,7 +34,7 @@ def pipeline(analyzer=None, **config):
         PersonTracker(),
         analyzer or Analyzer(),
         {"alice": [np.array([1.0, 0.0])]},
-        RecognitionConfig(**config),
+        RecognitionConfig(**{"recognition_interval": 0, **config}),
         quality=lambda f, face: f[0, 0, 0] == 0,
     )
 
