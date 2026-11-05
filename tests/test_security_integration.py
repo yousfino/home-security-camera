@@ -157,6 +157,7 @@ def monitor_args():
         max_frames=4,
         max_frame_age=1,
         metrics=False,
+        save_crops=True,
     )
 
 

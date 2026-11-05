@@ -203,6 +203,7 @@ def save_event(
     captured_at: datetime | None = None,
     episode_id: str | None = None,
     event_key: str | None = None,
+    max_storage_bytes: int | None = None,
 ) -> int:
     if (
         status not in ("familiar", "unfamiliar", "unresolved")
@@ -210,6 +211,8 @@ def save_event(
         or not -1 <= score <= 1
     ):
         raise ValueError("Invalid event classification or score")
+    if max_storage_bytes is not None and max_storage_bytes <= 0:
+        raise ValueError("Storage budget must be positive")
     if (status == "familiar") != (name is not None):
         raise ValueError("Only familiar events must have a profile name")
     if name is not None:
@@ -244,6 +247,11 @@ def save_event(
                     stream.flush()
                     os.fsync(stream.fileno())
                 final = crop_dir / f"event_{uuid4().hex}.jpg"
+            projected = storage_bytes(db_path, crop_dir) + 65536
+            if max_storage_bytes is not None and projected > max_storage_bytes:
+                raise StorageLimitError(
+                    "Storage budget exceeded; run maintenance or increase the budget"
+                )
             with database(db_path) as db:
                 cursor = db.execute(
                     "INSERT INTO events(captured_at,status,profile_name,similarity,image_path,"
@@ -296,12 +304,23 @@ def maintain_events(
         with database(db_path) as db:
             if retention_days is not None:
                 cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+                db.execute(
+                    "DELETE FROM episodes WHERE last_seen < ? AND episode_id NOT IN "
+                    "(SELECT episode_id FROM events WHERE episode_id IS NOT NULL)",
+                    (cutoff,),
+                )
                 db.execute("DELETE FROM events WHERE captured_at < ?", (cutoff,))
             if max_events is not None:
                 db.execute(
                     "DELETE FROM events WHERE id NOT IN "
                     "(SELECT id FROM events ORDER BY id DESC LIMIT ?)",
                     (max_events,),
+                )
+            if retention_days is not None:
+                db.execute(
+                    "DELETE FROM episodes WHERE last_seen < ? AND episode_id NOT IN "
+                    "(SELECT episode_id FROM events WHERE episode_id IS NOT NULL)",
+                    (cutoff,),
                 )
             referenced = set()
             for event_id, image in db.execute(
@@ -342,3 +361,63 @@ def save_episodes(
                     episode.state,
                 ),
             )
+
+
+class StorageLimitError(RuntimeError):
+    """Application storage admission budget exceeded; no new event was written."""
+
+
+def storage_bytes(db_path: Path, crop_dir: Path) -> int:
+    paths = [db_path, db_path.parent / "gallery.npz"]
+    if crop_dir.exists():
+        paths.extend(p for p in crop_dir.iterdir() if p.is_file() and not p.is_symlink())
+    return sum(p.stat().st_size for p in paths if p.exists() and not p.is_symlink())
+
+
+def delete_profile(
+    gallery_path: Path, db_path: Path, crops: Path, name: str, purge_events: bool = True
+) -> dict:
+    """Idempotent deletion. Gallery removal precedes metadata purge.
+
+    If a later operation fails, rerun to finish purging; removed embeddings are
+    never restored. Only events linked by a known profile/episode can be identified.
+    """
+    name = safe_profile_name(name)
+    removed = False
+    count = 0
+    with file_lock(gallery_path):
+        gallery = load_gallery(gallery_path)
+        if name in gallery:
+            with np.load(gallery_path, allow_pickle=False) as archive:
+                model = str(archive["__model__"]) if "__model__" in archive else "legacy"
+            del gallery[name]
+            _save_gallery(gallery_path, gallery, model)
+            removed = True
+        if purge_events and db_path.exists():
+            with file_lock(db_path), database(db_path) as db:
+                db.execute("PRAGMA secure_delete=ON")
+                linked = [
+                    r[0]
+                    for r in db.execute(
+                        "SELECT DISTINCT episode_id FROM events WHERE profile_name=? AND episode_id IS NOT NULL",
+                        (name,),
+                    )
+                ]
+                for episode in linked:
+                    count += db.execute(
+                        "DELETE FROM events WHERE episode_id=?", (episode,)
+                    ).rowcount
+                    db.execute("DELETE FROM episodes WHERE episode_id=?", (episode,))
+                count += db.execute("DELETE FROM events WHERE profile_name=?", (name,)).rowcount
+            maintain_events(db_path, crops)
+    return {
+        "profile_removed": removed,
+        "events_removed": count,
+        "limitations": "Unassociated unfamiliar crops and external backups cannot be identified by profile.",
+    }
+
+
+def drop_crops(db_path: Path, crop_dir: Path) -> None:
+    with file_lock(db_path), database(db_path) as db:
+        db.execute("UPDATE events SET image_path=NULL")
+    maintain_events(db_path, crop_dir)

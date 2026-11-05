@@ -16,7 +16,7 @@ import numpy as np
 
 from .capture import LatestFrameCapture
 from .config import RecognitionConfig, positive_int, finite_float
-from .core import normalized
+from .core import normalized, GalleryIndex
 from .quality import QualityConfig
 from .detection import YoloPersonDetector
 from .display import HeadlessDisplay, OpenCVDisplay
@@ -31,6 +31,9 @@ from .storage import (
     maintain_events,
     safe_profile_name,
     save_episodes,
+    file_lock,
+    delete_profile,
+    drop_crops,
 )
 from .tracking import PersonTracker
 from .vision import create_analyzer, crop_face, quality_ok
@@ -118,14 +121,12 @@ def enroll(args: argparse.Namespace, gallery_path: Path) -> None:
         print("Enrollment incomplete; nothing saved")
         return
     save_profile(gallery_path, name, samples, model.fingerprint, replace=args.replace)
-    print(f"Saved {len(samples)} templates for {name}; protect {gallery_path} as biometric data")
+    print(f"Saved {len(samples)} enrollment templates in protected local storage")
 
 
 def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: Path) -> None:
     model = create_analyzer(args.det_size, args.face_model_root)
     gallery = load_gallery(gallery_path, expected_model=model.fingerprint)
-    if not gallery:
-        raise ValueError("No profiles enrolled; run enroll first")
     detector = YoloPersonDetector(
         args.person_model, args.person_confidence, sha256=args.person_sha256
     )
@@ -144,6 +145,7 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
         lambda: camera(args.camera, args.width, args.height), max_attempts=args.reconnect_attempts
     ).start()
     display = HeadlessDisplay() if args.headless else OpenCVDisplay("Home Security Camera")
+    gallery_stamp = None
     frames = 0
     generation = None
     runtime_start = time.monotonic()
@@ -166,43 +168,66 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
             if time.monotonic() - timestamp > args.max_frame_age:
                 pipeline.reset()
                 continue
-            decisions = pipeline.process(frame, timestamp)
-            if time.monotonic() - timestamp > args.max_frame_age:
-                # Slow inference must not emit an event for stale evidence.
-                pipeline.reset()
-                continue
-            decisions = episodes.update(decisions, timestamp)
-            try:
-                save_episodes(db_path, episodes.pending(), session_id, wall_start, monotonic_start)
-            except (OSError, sqlite3.Error):
-                logging.error("Episode checkpoint failed")
-            else:
-                episodes.checkpointed()
-            for decision in decisions:
-                if decision.emit:
-                    crop = (
-                        crop_face(frame, decision.face) if decision.status == "unfamiliar" else None
+            with file_lock(gallery_path):
+                stamp = (
+                    (gallery_path.stat().st_mtime_ns, gallery_path.stat().st_size)
+                    if gallery_path.exists()
+                    else None
+                )
+                if stamp != gallery_stamp:
+                    pipeline.gallery = GalleryIndex(
+                        load_gallery(gallery_path, model.fingerprint),
+                        recognition_config(args).aggregation,
                     )
-                    try:
-                        save_event(
-                            db_path,
-                            crops,
-                            decision.status,
-                            decision.name,
-                            decision.score,
-                            crop,
-                            track_id=decision.track_id,
-                            session_id=session_id,
-                            model_id=model.fingerprint,
-                            episode_id=decision.episode_id,
-                            event_key=decision.event_key,
-                            captured_at=wall_start + timedelta(seconds=timestamp - monotonic_start),
+                    pipeline.reset()
+                    episodes.close()
+                    gallery_stamp = stamp
+                decisions = pipeline.process(frame, timestamp)
+                if time.monotonic() - timestamp > args.max_frame_age:
+                    # Slow inference must not emit an event for stale evidence.
+                    pipeline.reset()
+                    continue
+                decisions = episodes.update(decisions, timestamp)
+                try:
+                    save_episodes(
+                        db_path, episodes.pending(), session_id, wall_start, monotonic_start
+                    )
+                except (OSError, sqlite3.Error):
+                    logging.error("Episode checkpoint failed")
+                else:
+                    episodes.checkpointed()
+                for decision in decisions:
+                    if decision.emit:
+                        crop = (
+                            crop_face(frame, decision.face)
+                            if decision.status == "unfamiliar"
+                            and getattr(args, "save_crops", False)
+                            else None
                         )
-                    except (OSError, sqlite3.Error, RuntimeError, cv2.error):
-                        logging.exception("Event persistence failed; cooldown was not advanced")
-                    else:
-                        pipeline.acknowledge(decision, timestamp)
-                        episodes.acknowledge(decision)
+                        try:
+                            save_event(
+                                db_path,
+                                crops,
+                                decision.status,
+                                decision.name,
+                                decision.score,
+                                crop,
+                                track_id=decision.track_id,
+                                session_id=session_id,
+                                model_id=model.fingerprint,
+                                episode_id=decision.episode_id,
+                                event_key=decision.event_key,
+                                max_storage_bytes=getattr(args, "storage_budget_mb", 512)
+                                * 1024
+                                * 1024,
+                                captured_at=wall_start
+                                + timedelta(seconds=timestamp - monotonic_start),
+                            )
+                        except (OSError, sqlite3.Error, RuntimeError, cv2.error):
+                            logging.exception("Event persistence failed; cooldown was not advanced")
+                        else:
+                            pipeline.acknowledge(decision, timestamp)
+                            episodes.acknowledge(decision)
             preview = frame.copy()
             for decision in decisions:
                 x1, y1, x2, y2 = map(int, decision.box)
@@ -250,7 +275,7 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
                 logging.error("Final episode checkpoint failed")
 
 
-def list_events(db_path: Path) -> None:
+def list_events(db_path: Path, show_identities: bool = False) -> None:
     if not db_path.exists():
         print("No events yet")
         return
@@ -259,7 +284,10 @@ def list_events(db_path: Path) -> None:
             "SELECT id,captured_at,status,profile_name,image_path "
             "FROM events ORDER BY id DESC LIMIT 30"
         ):
-            print(*row, sep=" | ")
+            print(
+                *row if show_identities else (row[0], row[1], row[2], "[identity/path hidden]"),
+                sep=" | ",
+            )
 
 
 def recognition_config(args: argparse.Namespace) -> RecognitionConfig:
@@ -338,6 +366,12 @@ def main() -> None:
             p.add_argument("--familiar-log-interval", type=finite_float, default=60.0)
             p.add_argument("--headless", action="store_true")
             p.add_argument("--metrics", action="store_true")
+            p.add_argument(
+                "--save-crops",
+                action="store_true",
+                help="Opt in to retaining unfamiliar face images",
+            )
+            p.add_argument("--storage-budget-mb", type=positive_int, default=512)
             p.add_argument("--recognition-interval", type=finite_float, default=0.2)
             p.add_argument(
                 "--max-frames",
@@ -351,7 +385,19 @@ def main() -> None:
             )
             p.add_argument("--retention-days", type=finite_float, default=7.0)
             p.add_argument("--max-events", type=positive_int, default=10000)
-    sub.add_parser("events")
+    p = sub.add_parser("events")
+    p.add_argument("--show-identities", action="store_true")
+    p = sub.add_parser(
+        "profile-delete", help="Remove profile and linked events; stop enrollment before deletion"
+    )
+    p.add_argument("--name", required=True)
+    p.add_argument("--keep-events", action="store_true")
+    p.add_argument("--yes", action="store_true", required=True)
+    p = sub.add_parser("maintain", help="Run retention/reconciliation on local data")
+    p.add_argument("--retention-days", type=finite_float, default=7.0)
+    p.add_argument("--max-events", type=positive_int, default=10000)
+    p.add_argument("--drop-crops", action="store_true")
+    p.add_argument("--yes", action="store_true", required=True)
     p = sub.add_parser("doctor", help="Offline runtime diagnostics; no camera required")
     p.add_argument("--check-models", action="store_true")
     p.add_argument("--person-model", type=Path)
@@ -401,12 +447,22 @@ def main() -> None:
             if not -1 <= args.enrollment_consistency < args.duplicate_threshold <= 1:
                 raise ValueError("Require -1 <= consistency < duplicate threshold <= 1")
         gallery, db, crops = data_paths(args.data_dir)
-        if args.command == "enroll":
+        if args.command == "profile-delete":
+            if db.exists():
+                init_db(db)
+            print(json.dumps(delete_profile(gallery, db, crops, args.name, not args.keep_events)))
+        elif args.command == "maintain":
+            init_db(db)
+            maintain_events(db, crops, args.retention_days, args.max_events)
+            if args.drop_crops:
+                drop_crops(db, crops)
+            print("Local data maintenance completed")
+        elif args.command == "enroll":
             enroll(args, gallery)
         elif args.command == "monitor":
             monitor(args, gallery, db, crops)
         else:
-            list_events(db)
+            list_events(db, args.show_identities)
     except (ValueError, RuntimeError) as exc:
         parser.exit(1, f"Error: {exc}\n")
     except KeyboardInterrupt:
