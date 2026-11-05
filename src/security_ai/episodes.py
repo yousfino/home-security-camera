@@ -27,9 +27,14 @@ def overlap(a: tuple, b: tuple) -> float:
 
 
 class EpisodeManager:
-    def __init__(self, gap: float = 2.0, reacquire_iou: float = 0.3) -> None:
+    def __init__(
+        self, gap: float = 2.0, reacquire_iou: float = 0.3, max_episodes: int = 10000
+    ) -> None:
         if not math.isfinite(gap) or gap <= 0 or not 0 < reacquire_iou <= 1:
             raise ValueError("Require positive episode gap and reacquisition IoU in (0,1]")
+        if max_episodes < 1:
+            raise ValueError("Episode capacity must be positive")
+        self.max_episodes = max_episodes
         self.gap, self.reacquire_iou = gap, reacquire_iou
         self.episodes: dict[str, Episode] = {}
         self.by_track: dict[int, str] = {}
@@ -75,6 +80,8 @@ class EpisodeManager:
             key = self.by_track.get(decision.track_id)
             episode = self.episodes.get(key)
             if episode is None or episode.state == "closed":
+                if len(self.episodes) >= self.max_episodes:
+                    raise RuntimeError("Episode checkpoint capacity exhausted")
                 episode = Episode(
                     uuid4().hex, decision.track_id, timestamp, timestamp, decision.box
                 )

@@ -6,8 +6,8 @@ import argparse
 import sqlite3
 import sys
 import time
-import logging
 import json
+from threading import Event
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 from pathlib import Path
@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from .capture import LatestFrameCapture
+from .operations import RuntimeMetrics, HealthReporter, log_event, read_health, shutdown_signals
 from .config import RecognitionConfig, positive_int, finite_float
 from .core import normalized, GalleryIndex
 from .quality import QualityConfig
@@ -32,6 +33,7 @@ from .storage import (
     safe_profile_name,
     save_episodes,
     file_lock,
+    database,
     delete_profile,
     drop_crops,
 )
@@ -124,7 +126,44 @@ def enroll(args: argparse.Namespace, gallery_path: Path) -> None:
     print(f"Saved {len(samples)} enrollment templates in protected local storage")
 
 
-def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: Path) -> None:
+def monitor(
+    args: argparse.Namespace,
+    gallery_path: Path,
+    db_path: Path,
+    crops: Path,
+    stop: Event | None = None,
+) -> None:
+    # One monitor per data directory. Profile deletion uses the gallery lock;
+    # health inspection never acquires this long-lived process lease.
+    with file_lock(db_path.with_name("monitor"), blocking=False):
+        metrics = RuntimeMetrics(
+            getattr(args, "memory_budget_mb", 2048), getattr(args, "cpu_budget_percent", 75.0)
+        )
+        reporter = HealthReporter(db_path.parent / "health.json")
+        reporter.write(metrics.snapshot("starting"))
+        try:
+            _run_monitor(args, gallery_path, db_path, crops, stop or Event(), metrics, reporter)
+        except BaseException as exc:
+            log_event("monitor_failed", reason=type(exc).__name__)
+            try:
+                reporter.write(metrics.snapshot("failed"))
+            except OSError:
+                log_event("health_write_failed")
+            raise
+        else:
+            reporter.write(metrics.snapshot("stopped"))
+            log_event("monitor_stopped")
+
+
+def _run_monitor(
+    args: argparse.Namespace,
+    gallery_path: Path,
+    db_path: Path,
+    crops: Path,
+    stop: Event,
+    metrics: RuntimeMetrics,
+    reporter: HealthReporter,
+) -> None:
     model = create_analyzer(args.det_size, args.face_model_root)
     gallery = load_gallery(gallery_path, expected_model=model.fingerprint)
     detector = YoloPersonDetector(
@@ -134,6 +173,7 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
         detector, PersonTracker(args.track_max_age), model, gallery, recognition_config(args)
     )
     pipeline.quality = lambda frame, face: quality_ok(frame, face, quality_config(args))
+    pipeline.max_people = getattr(args, "max_people", 10)
     init_db(db_path)
     maintain_events(db_path, crops, args.retention_days, args.max_events)
     episodes = EpisodeManager(
@@ -141,32 +181,81 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
     )
     session_id = uuid4().hex
     wall_start, monotonic_start = datetime.now(timezone.utc), time.monotonic()
+    # The process lease makes prior sessions known to be inactive for this directory.
+    with database(db_path) as db:
+        db.execute(
+            "UPDATE episodes SET state='closed' WHERE session_id<>? AND state<>'closed'",
+            (session_id,),
+        )
     cap = LatestFrameCapture(
         lambda: camera(args.camera, args.width, args.height), max_attempts=args.reconnect_attempts
     ).start()
     display = HeadlessDisplay() if args.headless else OpenCVDisplay("Home Security Camera")
-    gallery_stamp = None
+    generation, gallery_stamp = None, None
     frames = 0
-    generation = None
-    runtime_start = time.monotonic()
+    runtime_start, last_frame, last_report = time.monotonic(), time.monotonic(), 0.0
+
+    def publish(force: bool = False) -> None:
+        nonlocal last_report
+        now = time.monotonic()
+        if force or now - last_report >= 1:
+            report = metrics.snapshot("healthy" if metrics.counts["processed"] else "starting")
+            reporter.write(report)
+            if args.metrics:
+                print(json.dumps(report), flush=True)
+            last_report = now
+
+    def checkpoint() -> None:
+        try:
+            save_episodes(
+                db_path,
+                episodes.pending(),
+                session_id,
+                wall_start,
+                monotonic_start,
+                max_storage_bytes=getattr(args, "storage_budget_mb", 512) * 1024 * 1024,
+            )
+        except (OSError, sqlite3.Error, RuntimeError) as exc:
+            metrics.faults.add("episode_persistence")
+            log_event("episode_checkpoint_failed", reason=type(exc).__name__)
+        else:
+            episodes.checkpointed()
+            metrics.faults.discard("episode_persistence")
+
     try:
-        while args.max_frames is None or frames < args.max_frames:
-            max_runtime = getattr(args, "max_runtime", None)
-            if max_runtime is not None and time.monotonic() - runtime_start >= max_runtime:
+        log_event("monitor_started")
+        while not stop.is_set() and (args.max_frames is None or frames < args.max_frames):
+            if (
+                getattr(args, "max_runtime", None) is not None
+                and time.monotonic() - runtime_start >= args.max_runtime
+            ):
                 break
             packet = cap.read()
             if packet is None:
+                metrics.counts["capture_waits"] += 1
+                if time.monotonic() - last_frame > getattr(args, "stall_timeout", 10.0):
+                    raise RuntimeError("Camera stalled without a fresh acquired frame")
+                metrics.faults.add("camera_waiting")
+                publish()
                 if not args.headless and cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                     break
                 continue
             frames += 1
+            last_frame = time.monotonic()
+            metrics.counts["acquired"] += 1
+            metrics.counts["dropped"] = cap.dropped
+            metrics.counts["reconnects"] = cap.reconnects
+            metrics.faults.discard("camera_waiting")
             if packet.generation != generation:
                 pipeline.reset()
-                generation = packet.generation
                 episodes.close()
+                generation = packet.generation
             frame, timestamp = packet.image, packet.acquired_at
             if time.monotonic() - timestamp > args.max_frame_age:
+                metrics.counts["stale"] += 1
+                metrics.faults.add("stale_frame")
                 pipeline.reset()
+                publish()
                 continue
             with file_lock(gallery_path):
                 stamp = (
@@ -183,96 +272,99 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
                     episodes.close()
                     gallery_stamp = stamp
                 decisions = pipeline.process(frame, timestamp)
-                if time.monotonic() - timestamp > args.max_frame_age:
-                    # Slow inference must not emit an event for stale evidence.
-                    pipeline.reset()
-                    continue
-                decisions = episodes.update(decisions, timestamp)
-                try:
-                    save_episodes(
-                        db_path, episodes.pending(), session_id, wall_start, monotonic_start
-                    )
-                except (OSError, sqlite3.Error):
-                    logging.error("Episode checkpoint failed")
+                age_ms = (time.monotonic() - timestamp) * 1000
+                metrics.observe({**pipeline.timings, "frame_age_ms": age_ms})
+                if pipeline.overflow_people:
+                    metrics.faults.add("person_capacity")
+                    metrics.counts["capacity_overflow_frames"] += 1
                 else:
-                    episodes.checkpointed()
+                    metrics.faults.discard("person_capacity")
+                if age_ms > args.max_frame_age * 1000:
+                    metrics.counts["stale"] += 1
+                    metrics.faults.add("stale_frame")
+                    pipeline.reset()
+                    publish()
+                    continue
+                if stop.is_set():
+                    break
+                metrics.faults.discard("stale_frame")
+                decisions = episodes.update(decisions, timestamp)
+                checkpoint()
                 for decision in decisions:
-                    if decision.emit:
-                        crop = (
-                            crop_face(frame, decision.face)
-                            if decision.status == "unfamiliar"
-                            and getattr(args, "save_crops", False)
-                            else None
+                    if not decision.emit:
+                        continue
+                    crop = (
+                        crop_face(frame, decision.face)
+                        if decision.status == "unfamiliar" and getattr(args, "save_crops", False)
+                        else None
+                    )
+                    try:
+                        save_event(
+                            db_path,
+                            crops,
+                            decision.status,
+                            decision.name,
+                            decision.score,
+                            crop,
+                            track_id=decision.track_id,
+                            session_id=session_id,
+                            model_id=model.fingerprint,
+                            episode_id=decision.episode_id,
+                            event_key=decision.event_key,
+                            max_storage_bytes=getattr(args, "storage_budget_mb", 512) * 1024 * 1024,
+                            captured_at=wall_start + timedelta(seconds=timestamp - monotonic_start),
                         )
-                        try:
-                            save_event(
-                                db_path,
-                                crops,
-                                decision.status,
-                                decision.name,
-                                decision.score,
-                                crop,
-                                track_id=decision.track_id,
-                                session_id=session_id,
-                                model_id=model.fingerprint,
-                                episode_id=decision.episode_id,
-                                event_key=decision.event_key,
-                                max_storage_bytes=getattr(args, "storage_budget_mb", 512)
-                                * 1024
-                                * 1024,
-                                captured_at=wall_start
-                                + timedelta(seconds=timestamp - monotonic_start),
-                            )
-                        except (OSError, sqlite3.Error, RuntimeError, cv2.error):
-                            logging.exception("Event persistence failed; cooldown was not advanced")
-                        else:
-                            pipeline.acknowledge(decision, timestamp)
-                            episodes.acknowledge(decision)
-            preview = frame.copy()
+                    except (OSError, sqlite3.Error, RuntimeError, cv2.error) as exc:
+                        metrics.counts["persistence_failures"] += 1
+                        metrics.faults.add("event_persistence")
+                        log_event("event_persistence_failed", reason=type(exc).__name__)
+                    else:
+                        pipeline.acknowledge(decision, timestamp)
+                        episodes.acknowledge(decision)
+                        metrics.counts["events"] += 1
+                        metrics.faults.discard("event_persistence")
+            metrics.counts["processed"] += 1
             for decision in decisions:
-                x1, y1, x2, y2 = map(int, decision.box)
-                cv2.rectangle(
-                    preview,
-                    (x1, y1),
-                    (x2, y2),
-                    (0, 255, 0) if decision.status == "familiar" else (0, 165, 255),
-                    2,
-                )
-                cv2.putText(
-                    preview,
-                    f"#{decision.track_id} {decision.status} {decision.name or ''}",
-                    (x1, max(20, y1)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (255, 255, 255),
-                    1,
-                )
+                metrics.counts[f"{decision.status}_decisions"] += 1
             if frames % 300 == 0:
                 try:
                     maintain_events(db_path, crops, args.retention_days, args.max_events)
-                except (OSError, sqlite3.Error):
-                    logging.exception("Event maintenance failed")
-            if args.metrics and frames % 30 == 0:
-                print(
-                    {
-                        **pipeline.timings,
-                        "frame_age_ms": (time.monotonic() - timestamp) * 1000,
-                        "dropped_frames": cap.dropped,
-                        "reconnects": cap.reconnects,
-                    }
-                )
-            if not display.show(preview):
-                break
+                except (OSError, sqlite3.Error) as exc:
+                    metrics.faults.add("maintenance")
+                    log_event("maintenance_failed", reason=type(exc).__name__)
+                else:
+                    metrics.faults.discard("maintenance")
+            publish()
+            if not args.headless:
+                preview = frame.copy()
+                for decision in decisions:
+                    x1, y1, x2, y2 = map(int, decision.box)
+                    cv2.rectangle(
+                        preview,
+                        (x1, y1),
+                        (x2, y2),
+                        (0, 255, 0) if decision.status == "familiar" else (0, 165, 255),
+                        2,
+                    )
+                    cv2.putText(
+                        preview,
+                        f"#{decision.track_id} {decision.status}",
+                        (x1, max(20, y1)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 255, 255),
+                        1,
+                    )
+                if not display.show(preview):
+                    break
+        publish(force=True)
     finally:
         try:
             cap.close()
         finally:
             display.close()
             episodes.close()
-            try:
-                save_episodes(db_path, episodes.pending(), session_id, wall_start, monotonic_start)
-            except (OSError, sqlite3.Error):
-                logging.error("Final episode checkpoint failed")
+            checkpoint()
 
 
 def list_events(db_path: Path, show_identities: bool = False) -> None:
@@ -294,6 +386,7 @@ def recognition_config(args: argparse.Namespace) -> RecognitionConfig:
     return RecognitionConfig(
         threshold=args.threshold,
         aggregation=getattr(args, "gallery_aggregation", "max"),
+        embeddings_per_frame=getattr(args, "embeddings_per_frame", 2),
         recognition_interval=args.recognition_interval,
         evidence_ttl=args.evidence_ttl,
         ambiguity_margin=args.ambiguity_margin,
@@ -325,7 +418,7 @@ def main() -> None:
         p.add_argument("--max-roll", type=finite_float, default=25.0)
         p.add_argument("--max-yaw-asymmetry", type=finite_float, default=0.6)
         p.add_argument("--reconnect-attempts", type=positive_int, default=8)
-        p.add_argument("--max-frame-age", type=finite_float, default=0.5)
+        p.add_argument("--max-frame-age", type=finite_float, default=2.0)
         p.add_argument("--width", type=positive_int, default=640)
         p.add_argument("--height", type=positive_int, default=480)
         p.add_argument("--det-size", type=positive_int, default=640)
@@ -365,6 +458,11 @@ def main() -> None:
             p.add_argument("--cooldown", type=finite_float, default=30.0)
             p.add_argument("--familiar-log-interval", type=finite_float, default=60.0)
             p.add_argument("--headless", action="store_true")
+            p.add_argument("--max-people", type=positive_int, default=10)
+            p.add_argument("--embeddings-per-frame", type=positive_int, default=2)
+            p.add_argument("--memory-budget-mb", type=positive_int, default=2048)
+            p.add_argument("--cpu-budget-percent", type=finite_float, default=75.0)
+            p.add_argument("--stall-timeout", type=finite_float, default=10.0)
             p.add_argument("--metrics", action="store_true")
             p.add_argument(
                 "--save-crops",
@@ -372,7 +470,7 @@ def main() -> None:
                 help="Opt in to retaining unfamiliar face images",
             )
             p.add_argument("--storage-budget-mb", type=positive_int, default=512)
-            p.add_argument("--recognition-interval", type=finite_float, default=0.2)
+            p.add_argument("--recognition-interval", type=finite_float, default=0.5)
             p.add_argument(
                 "--max-frames",
                 type=positive_int,
@@ -413,8 +511,16 @@ def main() -> None:
         required=True,
         help="Attest evaluation samples were not used for enrollment",
     )
+    p = sub.add_parser("health", help="Read local monitor health; exit 1 if stale/degraded/stopped")
+    p.add_argument("--max-age", type=finite_float, default=10.0)
     args = parser.parse_args()
     try:
+        if args.command == "health":
+            report = read_health(args.data_dir / "health.json", args.max_age)
+            print(json.dumps(report))
+            if not report["healthy"]:
+                parser.exit(1)
+            return
         if args.command == "calibrate":
             from .calibration import evaluate, load_scores
 
@@ -436,6 +542,9 @@ def main() -> None:
             raise ValueError("Maximum frame age must be positive")
         if args.command == "monitor":
             recognition_config(args)
+            RuntimeMetrics(args.memory_budget_mb, args.cpu_budget_percent)
+            if args.stall_timeout <= 0:
+                raise ValueError("Stall timeout must be positive")
             EpisodeManager(args.episode_gap, args.reacquire_iou)
             if args.max_runtime is not None and args.max_runtime <= 0:
                 raise ValueError("Maximum runtime must be positive")
@@ -460,11 +569,14 @@ def main() -> None:
         elif args.command == "enroll":
             enroll(args, gallery)
         elif args.command == "monitor":
-            monitor(args, gallery, db, crops)
+            with shutdown_signals() as stop:
+                monitor(args, gallery, db, crops, stop)
         else:
             list_events(db, args.show_identities)
     except (ValueError, RuntimeError) as exc:
         parser.exit(1, f"Error: {exc}\n")
+    except (OSError, sqlite3.Error) as exc:
+        parser.exit(1, f"Error: local operation failed ({type(exc).__name__})\n")
     except KeyboardInterrupt:
         print("Stopped")
 

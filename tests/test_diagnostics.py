@@ -29,7 +29,7 @@ def test_stale_frames_respect_frame_limit(tmp_path, monkeypatch):
     model.fingerprint = "test"
     monkeypatch.setattr(cli, "create_analyzer", lambda *_: model)
     monkeypatch.setattr(cli, "YoloPersonDetector", lambda *_a, **_k: Detector())
-    stream = Mock()
+    stream = Mock(dropped=0, reconnects=0)
     stream.start.return_value = stream
     stream.read.return_value = CapturedFrame(np.zeros((240, 320, 3), np.uint8), 0, 1)
     monkeypatch.setattr(cli, "LatestFrameCapture", lambda *_a, **_k: stream)

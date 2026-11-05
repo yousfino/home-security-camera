@@ -54,6 +54,8 @@ class RecognitionPipeline:
         )
         self.states: dict[int, TrackState] = {}
         self.timings: dict[str, float] = {}
+        self.max_people = 10
+        self.overflow_people = 0
 
     def reset(self) -> None:
         self.tracker.reset()
@@ -68,6 +70,8 @@ class RecognitionPipeline:
     def process(self, frame: np.ndarray, timestamp: float) -> list[TrackDecision]:
         started = time.perf_counter()
         detections = self.detector.detect(frame)
+        self.overflow_people = max(0, len(detections) - self.max_people)
+        detections = sorted(detections, key=lambda d: d.confidence, reverse=True)[: self.max_people]
         detected = time.perf_counter()
         tracks = self.tracker.update(detections, timestamp)
         tracked = time.perf_counter()
@@ -81,6 +85,18 @@ class RecognitionPipeline:
         associations = associate_faces(tracks, faces)
         by_track = {track_id: faces[i] for i, track_id in associations.items()}
         results = []
+        recognitions = 0
+        # Oldest evidence first prevents high-confidence tracks from starving
+        # the remaining people when CPU inference is slower than its cadence.
+        tracks.sort(
+            key=lambda track: (
+                self.states[track.track_id].last_evidence
+                if track.track_id in self.states
+                and self.states[track.track_id].last_evidence is not None
+                else float("-inf"),
+                track.track_id,
+            )
+        )
         for track in tracks:
             state = self.states.setdefault(
                 track.track_id,
@@ -95,13 +111,14 @@ class RecognitionPipeline:
                 state.window.clear()
             status, name, score = "unresolved", None, -1.0
             if self.gallery.names and face is not None and self.quality(frame, face):
-                if (
+                if recognitions >= self.config.embeddings_per_frame or (
                     state.last_evidence is not None
                     and timestamp - state.last_evidence < self.config.recognition_interval
                 ):
                     # No new identity observation or event on skipped inference.
                     results.append(TrackDecision(track.track_id, track.box, face=face))
                     continue
+                recognitions += 1
                 embedding = self.analyzer.embed(frame, face)
                 name, score, runner_up = self.gallery.match(embedding)
                 status = classify(name, score, self.config.threshold, True)

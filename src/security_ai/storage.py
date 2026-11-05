@@ -43,7 +43,7 @@ def data_paths(base: Path) -> tuple[Path, Path, Path]:
 
 
 @contextmanager
-def file_lock(path: Path) -> Iterator[None]:
+def file_lock(path: Path, blocking: bool = True) -> Iterator[None]:
     """Cooperating writers only; local filesystem locking, including Windows."""
     lock = path.with_name(path.name + ".lock")
     private_file(lock)
@@ -56,11 +56,11 @@ def file_lock(path: Path) -> Iterator[None]:
                 stream.write(b"0")
                 stream.flush()
             stream.seek(0)
-            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
         else:
             import fcntl
 
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         try:
             yield
         finally:
@@ -342,11 +342,21 @@ def maintain_events(
 
 
 def save_episodes(
-    db_path: Path, episodes: list, session_id: str, wall_start: datetime, monotonic_start: float
+    db_path: Path,
+    episodes: list,
+    session_id: str,
+    wall_start: datetime,
+    monotonic_start: float,
+    max_storage_bytes: int | None = None,
 ) -> None:
     if not episodes:
         return
     with file_lock(db_path), database(db_path) as db:
+        if (
+            max_storage_bytes is not None
+            and storage_bytes(db_path, db_path.parent / "crops") + 65536 > max_storage_bytes
+        ):
+            raise StorageLimitError("Episode checkpoint storage budget exceeded")
         for episode in episodes:
             started = wall_start + timedelta(seconds=episode.started - monotonic_start)
             seen = wall_start + timedelta(seconds=episode.last_seen - monotonic_start)
