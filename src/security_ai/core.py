@@ -1,4 +1,5 @@
 """Pure recognition and decision helpers, suitable for unit tests."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,7 +15,9 @@ def normalized(vector: np.ndarray) -> np.ndarray:
     return v / norm
 
 
-def best_match(embedding: np.ndarray, gallery: dict[str, list[np.ndarray]]) -> tuple[str | None, float]:
+def best_match(
+    embedding: np.ndarray, gallery: dict[str, list[np.ndarray]]
+) -> tuple[str | None, float]:
     query = normalized(embedding)
     best_name, best_score = None, -1.0
     for name, samples in gallery.items():
@@ -52,11 +55,16 @@ class DecisionWindow:
 
     def add(self, obs: Observation) -> tuple[str, str | None]:
         self.observations.append(obs)
-        usable = [o for o in self.observations if o.status != "unresolved"]
+        # A rejected frame breaks evidence continuity. Never emit a historical
+        # decision against a low-quality current observation.
+        if obs.status == "unresolved":
+            self.clear()
+            return "unresolved", None
+        usable = list(self.observations)
         if len(usable) < self.minimum:
             return "unresolved", None
         # Avoid accepting an identity when recent evidence disagrees.
-        recent = usable[-self.minimum:]
+        recent = usable[-self.minimum :]
         if all(o.status == "familiar" and o.name == recent[0].name for o in recent):
             return "familiar", recent[0].name
         if all(o.status == "unfamiliar" for o in recent):

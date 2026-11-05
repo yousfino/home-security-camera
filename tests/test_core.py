@@ -4,14 +4,14 @@ from security_ai.core import normalized, best_match, classify, Observation, Deci
 
 
 def test_normalization():
-    assert np.allclose(normalized(np.array([3,4])), [0.6,0.8])
+    assert np.allclose(normalized(np.array([3, 4])), [0.6, 0.8])
     with pytest.raises(ValueError):
         normalized(np.zeros(2))
 
 
 def test_matching():
-    gallery = {"alice": [np.array([1.,0.])], "bob": [np.array([0.,1.])]}
-    name, score = best_match(np.array([0.99,0.01]), gallery)
+    gallery = {"alice": [np.array([1.0, 0.0])], "bob": [np.array([0.0, 1.0])]}
+    name, score = best_match(np.array([0.99, 0.01]), gallery)
     assert name == "alice" and score > 0.99
 
 
@@ -27,3 +27,18 @@ def test_stability():
     assert window.add(Observation("unfamiliar", None, 0.1))[0] == "unfamiliar"
     window.clear()
     assert window.add(Observation("familiar", "alice", 0.9))[0] == "unresolved"
+
+
+def test_unresolved_breaks_decision_evidence():
+    window = DecisionWindow()
+    for _ in range(3):
+        window.add(Observation("familiar", "alice", 0.9))
+    assert window.add(Observation("unresolved", None, -1)) == ("unresolved", None)
+    assert window.add(Observation("familiar", "alice", 0.9)) == ("unresolved", None)
+
+
+def test_conflicting_identity_is_unresolved():
+    window = DecisionWindow()
+    for _ in range(3):
+        window.add(Observation("familiar", "alice", 0.9))
+    assert window.add(Observation("familiar", "bob", 0.9)) == ("unresolved", None)

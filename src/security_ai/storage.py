@@ -1,7 +1,7 @@
 """Local SQLite events and NumPy enrollment gallery. NOT encrypted at rest."""
+
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -20,7 +20,10 @@ def load_gallery(path: Path) -> dict[str, list[np.ndarray]]:
         return {}
     # allow_pickle=False is important: do not load executable pickle payloads.
     with np.load(path, allow_pickle=False) as archive:
-        return {key: [np.asarray(row, dtype=np.float32) for row in archive[key]] for key in archive.files}
+        return {
+            key: [np.asarray(row, dtype=np.float32) for row in archive[key]]
+            for key in archive.files
+        }
 
 
 def save_gallery(path: Path, gallery: dict[str, list[np.ndarray]]) -> None:
@@ -49,14 +52,22 @@ def init_db(path: Path) -> None:
         )""")
 
 
-def save_event(db_path: Path, crop_dir: Path, status: str,
-               name: str | None, score: float, crop: np.ndarray | None) -> int:
+def save_event(
+    db_path: Path,
+    crop_dir: Path,
+    status: str,
+    name: str | None,
+    score: float,
+    crop: np.ndarray | None,
+) -> int:
     captured = datetime.now(timezone.utc).isoformat()
     crop_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     with sqlite3.connect(db_path) as db:
         cursor = db.execute(
             "INSERT INTO events(captured_at,status,profile_name,similarity,image_path) "
-            "VALUES (?,?,?,?,NULL)", (captured, status, name, score))
+            "VALUES (?,?,?,?,NULL)",
+            (captured, status, name, score),
+        )
         event_id = int(cursor.lastrowid)
         if crop is not None and crop.size:
             path = crop_dir / f"event_{event_id:06d}.jpg"
