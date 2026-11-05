@@ -154,3 +154,82 @@ def test_embedding_budget_is_fair_across_ten_people():
         p.process(frame, index * 0.1)
         assert len(calls) - before == 2
     assert set(calls) == set(range(10))
+
+
+def test_native_memory_measurement_is_available_on_supported_hosts():
+    import sys
+    from security_ai.operations import memory_mb
+
+    if sys.platform.startswith("linux") or sys.platform == "win32":
+        assert memory_mb() is not None and memory_mb() > 0
+
+
+def test_maximum_runtime_ends_camera_outage_without_hardware(tmp_path, monkeypatch):
+    gallery, db, crops = data_paths(tmp_path / "private")
+    model = Analyzer()
+    model.fingerprint = "test"
+    monkeypatch.setattr(cli, "create_analyzer", lambda *_: model)
+    monkeypatch.setattr(cli, "YoloPersonDetector", lambda *_a, **_k: Detector())
+    clock = [0.0]
+
+    def now():
+        clock[0] += 0.01
+        return clock[0]
+
+    monkeypatch.setattr(cli.time, "monotonic", now)
+    stream = Mock(dropped=0, reconnects=0)
+    stream.start.return_value = stream
+    stream.read.return_value = None
+    monkeypatch.setattr(cli, "LatestFrameCapture", lambda *_a, **_k: stream)
+    args = monitor_args()
+    args.max_runtime = 0.2
+    args.max_frames = None
+    cli.monitor(args, gallery, db, crops)
+    assert 0 < stream.read.call_count < 20
+    stream.close.assert_called_once()
+
+
+def test_startup_failure_is_visible_in_health_without_exception_text(tmp_path, monkeypatch):
+    gallery, db, crops = data_paths(tmp_path / "private")
+
+    def fail(*_):
+        raise ValueError("private name and private path must not enter health")
+
+    monkeypatch.setattr(cli, "create_analyzer", fail)
+    with pytest.raises(ValueError):
+        cli.monitor(monitor_args(), gallery, db, crops)
+    report = json.loads((db.parent / "health.json").read_text())
+    assert report["state"] == "failed"
+    assert "private name" not in json.dumps(report)
+
+
+def test_stale_frames_do_not_disrupt_periodic_retention(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from security_ai.capture import CapturedFrame
+
+    gallery, db, crops = data_paths(tmp_path / "private")
+    monkeypatch.setattr(cli, "create_analyzer", lambda *_: SimpleNamespace(fingerprint="test"))
+    monkeypatch.setattr(cli, "YoloPersonDetector", lambda *_a, **_k: object())
+    fake_pipeline = SimpleNamespace(
+        reset=lambda: None, process=lambda *_: [], timings={}, overflow_people=0
+    )
+    monkeypatch.setattr(cli, "RecognitionPipeline", lambda *_: fake_pipeline)
+    maintenance = Mock()
+    monkeypatch.setattr(cli, "maintain_events", maintenance)
+    now = cli.time.monotonic()
+    count = 0
+
+    def next_frame():
+        nonlocal count
+        count += 1
+        return CapturedFrame(np.zeros((8, 8, 3), np.uint8), 0 if count == 1 else now, 1)
+
+    stream = Mock(dropped=0, reconnects=0)
+    stream.start.return_value = stream
+    stream.read.side_effect = next_frame
+    monkeypatch.setattr(cli, "LatestFrameCapture", lambda *_a, **_k: stream)
+    args = monitor_args()
+    args.max_frames = 301
+    args.max_frame_age = 10
+    cli.monitor(args, gallery, db, crops)
+    assert maintenance.call_count == 2  # startup plus 300 successfully processed frames

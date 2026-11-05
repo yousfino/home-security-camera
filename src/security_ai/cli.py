@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import sqlite3
 import sys
 import time
@@ -172,6 +173,7 @@ def _run_monitor(
     pipeline = RecognitionPipeline(
         detector, PersonTracker(args.track_max_age), model, gallery, recognition_config(args)
     )
+    del gallery
     pipeline.quality = lambda frame, face: quality_ok(frame, face, quality_config(args))
     pipeline.max_people = getattr(args, "max_people", 10)
     init_db(db_path)
@@ -192,6 +194,7 @@ def _run_monitor(
     ).start()
     display = HeadlessDisplay() if args.headless else OpenCVDisplay("Home Security Camera")
     generation, gallery_stamp = None, None
+    pending_events: set[str] = set()
     frames = 0
     runtime_start, last_frame, last_report = time.monotonic(), time.monotonic(), 0.0
 
@@ -271,6 +274,8 @@ def _run_monitor(
                     pipeline.reset()
                     episodes.close()
                     gallery_stamp = stamp
+                    pending_events.clear()
+                    metrics.faults.discard("event_persistence")
                 decisions = pipeline.process(frame, timestamp)
                 age_ms = (time.monotonic() - timestamp) * 1000
                 metrics.observe({**pipeline.timings, "frame_age_ms": age_ms})
@@ -315,6 +320,9 @@ def _run_monitor(
                             captured_at=wall_start + timedelta(seconds=timestamp - monotonic_start),
                         )
                     except (OSError, sqlite3.Error, RuntimeError, cv2.error) as exc:
+                        if len(pending_events) >= 1024:
+                            raise RuntimeError("Pending event failure capacity exhausted") from exc
+                        pending_events.add(decision.event_key)
                         metrics.counts["persistence_failures"] += 1
                         metrics.faults.add("event_persistence")
                         log_event("event_persistence_failed", reason=type(exc).__name__)
@@ -322,11 +330,13 @@ def _run_monitor(
                         pipeline.acknowledge(decision, timestamp)
                         episodes.acknowledge(decision)
                         metrics.counts["events"] += 1
-                        metrics.faults.discard("event_persistence")
+                        pending_events.discard(decision.event_key)
+                        if not pending_events:
+                            metrics.faults.discard("event_persistence")
             metrics.counts["processed"] += 1
             for decision in decisions:
                 metrics.counts[f"{decision.status}_decisions"] += 1
-            if frames % 300 == 0:
+            if metrics.counts["processed"] % 300 == 0:
                 try:
                     maintain_events(db_path, crops, args.retention_days, args.max_events)
                 except (OSError, sqlite3.Error) as exc:
@@ -371,7 +381,7 @@ def list_events(db_path: Path, show_identities: bool = False) -> None:
     if not db_path.exists():
         print("No events yet")
         return
-    with sqlite3.connect(db_path) as db:
+    with closing(sqlite3.connect(db_path)) as db:
         for row in db.execute(
             "SELECT id,captured_at,status,profile_name,image_path "
             "FROM events ORDER BY id DESC LIMIT 30"

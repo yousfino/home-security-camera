@@ -1,6 +1,10 @@
 # Device acceptance record
 
 Status: **PENDING**. Synthetic/cloud checks are not live-device validation.
+Target device: Windows laptop integrated webcam. Development occupancy target: 10
+people. Starting configurable budgets: 2-second frame age, 0.5-second recognition
+interval, 2 embeddings/frame, 2 GiB process RAM and 75% normalized CPU. These are
+chosen targets, not measurements; set recognition error tolerances using calibration.
 Use a private copy of this worksheet for results that contain personal data.
 
 Record device/OS, Python version, camera/backend, input dimensions, model source,

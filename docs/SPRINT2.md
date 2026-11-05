@@ -1,5 +1,8 @@
 # Sprint 2 implementation and test guide
 
+Historical Sprint 2 guide. For current schema, Windows setup and tests, use
+[SPRINT3.md](SPRINT3.md).
+
 ## Six stacked branches
 
 Each branch includes its predecessor. Create PRs in this order, using the listed

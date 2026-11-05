@@ -67,3 +67,41 @@ def test_deletion_cli_requires_explicit_confirmation(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 2
+
+
+def test_monitor_reloads_deleted_profile_before_next_frame(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    from security_ai.capture import CapturedFrame
+    from test_pipeline import Analyzer, Detector
+    from test_security_integration import monitor_args
+
+    gallery, db, crops = data_paths(tmp_path / "private")
+    save_profile(gallery, "alice", [np.array([1.0, 0.0])], "test")
+    model = Analyzer()
+    model.fingerprint = "test"
+    monkeypatch.setattr(cli, "create_analyzer", lambda *_: model)
+    monkeypatch.setattr(cli, "YoloPersonDetector", lambda *_a, **_k: Detector())
+    monkeypatch.setattr(cli, "quality_ok", lambda *_: True)
+    now = cli.time.monotonic()
+    count = 0
+
+    def next_frame():
+        nonlocal count
+        count += 1
+        if count == 4:
+            delete_profile(gallery, db, crops, "alice")
+        return CapturedFrame(np.zeros((240, 320, 3), np.uint8), now - 0.4 + count * 0.05, 1)
+
+    stream = Mock(dropped=0, reconnects=0)
+    stream.start.return_value = stream
+    stream.read.side_effect = next_frame
+    monkeypatch.setattr(cli, "LatestFrameCapture", lambda *_a, **_k: stream)
+    args = monitor_args()
+    args.max_frames = 8
+    cli.monitor(args, gallery, db, crops)
+    assert not load_gallery(gallery)
+    with sqlite3.connect(db) as conn:
+        assert (
+            conn.execute("SELECT count(*) FROM events WHERE profile_name IS NOT NULL").fetchone()[0]
+            == 0
+        )

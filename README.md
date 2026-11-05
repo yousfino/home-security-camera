@@ -1,4 +1,4 @@
-# Home Security Camera — Sprint 2
+# Home Security Camera — Sprint 3
 
 Local-first indoor person tracking and face recognition on Python **3.11**.
 An experimental prototype, not a certified security or emergency system.
@@ -8,6 +8,31 @@ InsightFace SCRFD/ArcFace, ONNX Runtime CPU, OpenCV, NumPy, and SQLite.
 Identity states are **familiar**, **unfamiliar**, and **unresolved**. Unfamiliar
 means no accepted gallery match; it does **not** mean a confirmed intruder.
 A person without an unambiguously associated, usable face remains unresolved.
+
+Sprint 3 adds local calibration reports, configurable quality checks, person episodes,
+privacy controls, Windows operation and local health/metrics. **Ten simultaneous
+people is a development target**, not validated laptop throughput or accuracy.
+
+Start with [Sprint 3 testing and PR guide](docs/SPRINT3.md),
+[Windows operation](docs/EDGE_OPERATION.md), and [privacy design](docs/PRIVACY_DESIGN.md).
+
+## Windows laptop quick start
+
+Use Python 3.11 64-bit. InsightFace may require Microsoft C++ Build Tools and the
+Windows SDK. Commands use the venv interpreter directly, without activation:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip 'setuptools>=75,<81' wheel
+.\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-windows-dev.lock
+.\.venv\Scripts\python.exe -m pip install --no-deps -e .
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m security_ai doctor
+```
+
+Automated tests require no webcam or weights. The Windows lock was resolved for
+Windows/Python 3.11; CI is configured to validate it on Windows. Local camera/model
+accuracy and native Windows runtime still need verification on that platform.
 
 ## Install and run automated tests
 
@@ -27,10 +52,10 @@ python -m pytest -q
 python -m ruff check src tests
 ```
 
-The lock includes development and tracking dependencies and was resolved for
-Python 3.11. If your distribution lacks Python 3.11, use an approved version
-manager. Windows users can create the environment with `py -3.11 -m venv .venv`
-and activate `.venv\Scripts\Activate.ps1` before running the Python commands.
+The Linux lock includes development and tracking dependencies and was resolved for
+Python 3.11. Windows installations must use `requirements-windows-dev.lock`.
+If your distribution lacks Python 3.11, use an approved version manager. Windows users can create the environment with `py -3.11 -m venv .venv`
+and activate `.venv\Scripts\Activate.ps1` before running the Python commands with the Windows lock.
 
 Automated tests require **no camera, model weights, graphical display, or real
 biometric data**. They use synthetic arrays and mocked camera/inference boundaries.
@@ -88,19 +113,25 @@ model fingerprints: archive them securely and enroll into a new private data
 directory. Do not silently label old embeddings with the current model hash.
 
 For local headless monitoring, add `--headless`; stop with Ctrl+C. A camera is
-required for live monitoring, never for tests. `--max-frames 300` limits successful
-processed frames; it is not a wall-clock timeout. Use `monitor --help` for controls.
+required for live monitoring, never for tests. `--max-frames 300` limits acquired
+frames, including stale ones. `--max-runtime 120` bounds elapsed operation between
+native calls, including outages. Use `monitor --help` for controls.
 
 The default recognition threshold **0.45**, ambiguity margin **0.05**, enrollment
 consistency **0.6**, and duplicate threshold **0.995** are illustrative and
 uncalibrated. Evaluate enrollment-independent samples for your device and risk
-requirements. See [Sprint 2 testing and review guide](docs/SPRINT2.md).
+requirements. See [Sprint 3 testing and review guide](docs/SPRINT3.md).
 
 ## Data and limitations
 
 - Templates, crops, and SQLite metadata remain **unencrypted**. Use device/disk
   encryption, a trusted account, and protected backups. Local permissions are
   enforced where the OS supports Unix modes.
+- Unfamiliar crop collection is off by default; `--save-crops` opts in. Profiles can
+  be deleted with `profile-delete --name NAME --yes`. Event names/paths are hidden
+  unless `events --show-identities` is requested.
+- Event episodes deduplicate classification events and conservatively reconnect
+  familiar identities; unknown people are not merged across track IDs.
 - Default event retention is 7 days and 10,000 events, enforced at startup and
   every 300 processed frames. These are periodic limits, not a hard disk quota.
   Missing crops and interrupted writes are reconciled at the same points.
@@ -115,6 +146,9 @@ requirements. See [Sprint 2 testing and review guide](docs/SPRINT2.md).
 - Model execution and storage are synchronous in the processing consumer; capture
   continues independently. Device benchmarks and sustained hardware testing remain
   required. No Firebase, Android, server, or remote application networking is added.
+
+Database migration now uses schema version 3. Back up private data before upgrading;
+rollback requires the old code/environment and matching pre-migration data backup.
 
 Never commit embeddings, crops, databases, weights, credentials, or captured video.
 Git ignore patterns are defense in depth and do not replace reviewing staged files.

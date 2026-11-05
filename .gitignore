@@ -38,3 +38,11 @@ run-project.txt
 *.webm
 *.safetensors
 *.ckpt
+
+# Local health, score evaluation and performance artifacts.
+health.json
+*.health.json
+*.metrics.jsonl
+*.scores.csv
+*.calibration.json
+monitor.lock
