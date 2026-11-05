@@ -85,3 +85,15 @@ def test_gallery_dimensions_ambiguity_and_enrollment(tmp_path):
     assert "a" in load_gallery(path, "v1")
     with pytest.raises(ValueError, match="model mismatch"):
         load_gallery(path, "v2")
+
+
+def test_empty_gallery_is_unresolved_not_unfamiliar():
+    p = pipeline(minimum=1)
+    p.gallery = GalleryIndex({})
+    results = p.process(np.zeros((240, 320, 3), np.uint8), 0)
+    assert all(r.status == "unresolved" and not r.emit for r in results)
+
+
+def test_gallery_rejects_matrix_samples():
+    with pytest.raises(ValueError, match="one-dimensional"):
+        GalleryIndex({"alice": [np.ones((2, 2))]})

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import hashlib
+import os
 import cv2
 import numpy as np
 
@@ -36,8 +37,6 @@ class LocalFaceAnalyzer:
 
 
 def create_analyzer(det_size: int = 640, root: Path | None = None) -> LocalFaceAnalyzer:
-    from insightface.app import FaceAnalysis
-
     root = (root or Path("~/.insightface")).expanduser()
     directory = root / "models" / "buffalo_l"
     files = sorted(directory.glob("*.onnx"))
@@ -45,6 +44,11 @@ def create_analyzer(det_size: int = 640, root: Path | None = None) -> LocalFaceA
         raise ValueError(
             f"Provision licensed buffalo_l ONNX weights in {directory}; no automatic downloads"
         )
+    # InsightFace imports Albumentations, whose version checker otherwise performs
+    # network requests on import. Runtime inference must stay local.
+    os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+    from insightface.app import FaceAnalysis
+
     analyzer = FaceAnalysis(
         name="buffalo_l",
         root=str(root),

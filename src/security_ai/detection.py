@@ -53,6 +53,10 @@ class YoloPersonDetector:
             else ort.InferenceSession(str(model), providers=["CPUExecutionProvider"])
         )
         inputs = self.session.get_inputs()
+        if not inputs:
+            raise ValueError("Model has no input")
+        if getattr(inputs[0], "type", "tensor(float)") != "tensor(float)":
+            raise ValueError("Export with float32 input")
         shape = inputs[0].shape
         if len(inputs) != 1 or len(shape) != 4 or shape[:2] != [1, 3]:
             raise ValueError("Expected a static batch-1 NCHW model")
@@ -65,7 +69,7 @@ class YoloPersonDetector:
     def detect(self, frame: np.ndarray) -> list[PersonDetection]:
         h, w = frame.shape[:2]
         scale = min(self.width / w, self.height / h)
-        rw, rh = round(w * scale), round(h * scale)
+        rw, rh = max(1, round(w * scale)), max(1, round(h * scale))
         left, top = (self.width - rw) // 2, (self.height - rh) // 2
         padded = np.full((self.height, self.width, 3), 114, dtype=np.uint8)
         padded[top : top + rh, left : left + rw] = cv2.resize(frame, (rw, rh))

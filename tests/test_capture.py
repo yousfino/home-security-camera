@@ -74,3 +74,33 @@ def test_inference_interval_never_replays_event():
     assert all(not r.emit and r.status == "unresolved" for r in results)
     assert all(r.emit for r in p.process(frame, 0.6))
     assert p.timings["total_ms"] >= p.timings["person_ms"]
+
+
+def test_slow_consumer_receives_latest_frame_only():
+    produced, finish = Event(), Event()
+
+    class FiniteCamera:
+        count = 0
+        closed = False
+
+        def read(self):
+            self.count += 1
+            if self.count > 3:
+                produced.set()
+                finish.wait(1)
+            return True, np.full((2, 2, 3), min(self.count, 255), np.uint8)
+
+        def release(self):
+            self.closed = True
+
+    camera = FiniteCamera()
+    stream = LatestFrameCapture(lambda: camera).start()
+    try:
+        assert produced.wait(1)
+        packet = stream.read(timeout=1)
+        assert int(packet.image[0, 0, 0]) == 3
+        assert stream.dropped == 2
+    finally:
+        finish.set()
+        stream.close()
+    assert camera.closed

@@ -10,6 +10,7 @@ import numpy as np
 from .config import RecognitionConfig
 from .core import DecisionWindow, GalleryIndex, Observation, classify
 from .detection import PersonDetector
+from .interfaces import FaceAnalyzer
 from .tracking import PersonTracker, associate_faces
 from .vision import quality_ok
 
@@ -38,10 +39,10 @@ class RecognitionPipeline:
         self,
         detector: PersonDetector,
         tracker: PersonTracker,
-        analyzer: Any,
+        analyzer: FaceAnalyzer,
         gallery: dict[str, list[np.ndarray]],
         config: RecognitionConfig,
-        quality: Callable = quality_ok,
+        quality: Callable[[np.ndarray, Any], bool] = quality_ok,
     ) -> None:
         self.detector, self.tracker, self.analyzer = detector, tracker, analyzer
         self.gallery, self.config, self.quality = GalleryIndex(gallery), config, quality
@@ -87,7 +88,7 @@ class RecognitionPipeline:
             ):
                 state.window.clear()
             status, name, score = "unresolved", None, -1.0
-            if face is not None and self.quality(frame, face):
+            if self.gallery.names and face is not None and self.quality(frame, face):
                 if (
                     state.last_evidence is not None
                     and timestamp - state.last_evidence < self.config.recognition_interval
