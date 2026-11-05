@@ -6,6 +6,9 @@ import argparse
 import sqlite3
 import sys
 import time
+import logging
+from datetime import datetime, timezone, timedelta
+from uuid import uuid4
 from pathlib import Path
 import cv2
 import numpy as np
@@ -16,7 +19,15 @@ from .core import normalized
 from .detection import YoloPersonDetector
 from .display import HeadlessDisplay, OpenCVDisplay
 from .pipeline import RecognitionPipeline
-from .storage import data_paths, init_db, load_gallery, save_event, save_gallery, safe_profile_name
+from .storage import (
+    data_paths,
+    init_db,
+    load_gallery,
+    save_event,
+    save_profile,
+    maintain_events,
+    safe_profile_name,
+)
 from .tracking import PersonTracker
 from .vision import create_analyzer, crop_face, quality_ok
 
@@ -102,8 +113,7 @@ def enroll(args: argparse.Namespace, gallery_path: Path) -> None:
     if len(samples) != args.samples:
         print("Enrollment incomplete; nothing saved")
         return
-    gallery[name] = samples
-    save_gallery(gallery_path, gallery, model_id=model.fingerprint)
+    save_profile(gallery_path, name, samples, model.fingerprint, replace=args.replace)
     print(f"Saved {len(samples)} templates for {name}; protect {gallery_path} as biometric data")
 
 
@@ -119,6 +129,9 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
         detector, PersonTracker(args.track_max_age), model, gallery, recognition_config(args)
     )
     init_db(db_path)
+    maintain_events(db_path, crops, args.retention_days, args.max_events)
+    session_id = uuid4().hex
+    wall_start, monotonic_start = datetime.now(timezone.utc), time.monotonic()
     cap = LatestFrameCapture(
         lambda: camera(args.camera, args.width, args.height), max_attempts=args.reconnect_attempts
     ).start()
@@ -140,13 +153,32 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
                 pipeline.reset()
                 continue
             decisions = pipeline.process(frame, timestamp)
+            if time.monotonic() - timestamp > args.max_frame_age:
+                # Slow inference must not emit an event for stale evidence.
+                pipeline.reset()
+                continue
             for decision in decisions:
                 if decision.emit:
                     crop = (
                         crop_face(frame, decision.face) if decision.status == "unfamiliar" else None
                     )
-                    save_event(db_path, crops, decision.status, decision.name, decision.score, crop)
-                    pipeline.acknowledge(decision, timestamp)
+                    try:
+                        save_event(
+                            db_path,
+                            crops,
+                            decision.status,
+                            decision.name,
+                            decision.score,
+                            crop,
+                            track_id=decision.track_id,
+                            session_id=session_id,
+                            model_id=model.fingerprint,
+                            captured_at=wall_start + timedelta(seconds=timestamp - monotonic_start),
+                        )
+                    except (OSError, sqlite3.Error, RuntimeError, cv2.error):
+                        logging.exception("Event persistence failed; cooldown was not advanced")
+                    else:
+                        pipeline.acknowledge(decision, timestamp)
             preview = frame.copy()
             for decision in decisions:
                 x1, y1, x2, y2 = map(int, decision.box)
@@ -167,6 +199,11 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
                     1,
                 )
             frames += 1
+            if frames % 300 == 0:
+                try:
+                    maintain_events(db_path, crops, args.retention_days, args.max_events)
+                except (OSError, sqlite3.Error):
+                    logging.exception("Event maintenance failed")
             if args.metrics and frames % 30 == 0:
                 print(
                     {
@@ -256,6 +293,8 @@ def main() -> None:
             p.add_argument("--metrics", action="store_true")
             p.add_argument("--recognition-interval", type=finite_float, default=0.2)
             p.add_argument("--max-frames", type=positive_int)
+            p.add_argument("--retention-days", type=finite_float, default=7.0)
+            p.add_argument("--max-events", type=positive_int, default=10000)
     sub.add_parser("events")
     args = parser.parse_args()
     try:
@@ -263,6 +302,8 @@ def main() -> None:
             raise ValueError("Maximum frame age must be positive")
         if args.command == "monitor":
             recognition_config(args)
+            if args.retention_days <= 0:
+                raise ValueError("Retention days must be positive")
             if args.track_max_age <= 0 or not 0 < args.person_confidence <= 1:
                 raise ValueError("Require positive track age and person confidence in (0,1]")
         elif args.command == "enroll":

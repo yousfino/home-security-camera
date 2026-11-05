@@ -1,72 +1,120 @@
-# Home Security Camera — Sprint 1
+# Home Security Camera — Sprint 2
 
-**Local-only experimental prototype. Not a certified security or emergency system.**
+Local-first indoor person tracking and face recognition on Python **3.11**.
+An experimental prototype, not a certified security or emergency system.
 
-## Requirements
-- Windows 10/11 or Linux x86_64, Python **3.11**, USB webcam, 8 GB RAM recommended.
-- No server, public port, cloud service, or Android app in this sprint.
-- InsightFace `buffalo_l` pretrained weights may be restricted to non-commercial research. Check licensing before use; the first run may download model weights from the internet. Offline operation starts after the weights are present.
-- Face templates and photos in `.local/` are **not encrypted** in Sprint 1. Only enroll consenting people, protect the device, and delete test data after evaluation.
+The pipeline uses a local YOLOv8/YOLO11 COCO ONNX person detector, ByteTrack,
+InsightFace SCRFD/ArcFace, ONNX Runtime CPU, OpenCV, NumPy, and SQLite.
+Identity states are **familiar**, **unfamiliar**, and **unresolved**. Unfamiliar
+means no accepted gallery match; it does **not** mean a confirmed intruder.
+A person without an unambiguously associated, usable face remains unresolved.
 
-## Windows PowerShell
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -e '.[dev]'
-python -m pytest -q
-security-ai enroll --name alice --samples 5
-security-ai monitor --threshold 0.45
-security-ai events
-```
-If activation is blocked, invoke `.\.venv\Scripts\python.exe` directly and use `python -m security_ai` instead of `security-ai`.
+## Install and run automated tests
 
-## Ubuntu Linux
+Linux prerequisites: Python 3.11 with headers/venv support, a C++ compiler,
+`libgl1`, and GLib (`libglib2.0-0` or the distribution's `libglib2.0-0t64`).
+On Ubuntu with Python 3.11 available:
+
 ```bash
-sudo apt update
-sudo apt install -y python3.11 python3.11-venv python3.11-dev build-essential cmake libgl1 libglib2.0-0
+sudo apt-get update
+sudo apt-get install -y python3.11 python3.11-venv python3.11-dev build-essential libgl1 libglib2.0-0
 python3.11 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -e '.[dev]'
+python -m pip install --upgrade pip 'setuptools>=75,<81' wheel
+python -m pip install --require-hashes -r requirements-dev.lock
+python -m pip install --no-deps -e .
 python -m pytest -q
-security-ai enroll --name alice --samples 5
-security-ai monitor --threshold 0.45
-security-ai events
+python -m ruff check src tests
 ```
-On newer Ubuntu releases without `python3.11` in official repositories, install Python 3.11 through an approved version manager such as `pyenv`, rather than assuming the apt package exists.
 
-## Usage
-- `security-ai enroll --name alice --samples 5`: only one consenting face in view; press SPACE to collect each sharp sample, Q to cancel.
-- `security-ai monitor --camera 0 --width 640 --height 480`: run the local monitoring window; Q exits.
-- `security-ai events`: list recent local events.
-- `security-ai --data-dir /some/private/path monitor`: choose another storage directory (global option before command).
-- `security-ai monitor --threshold 0.45`: **example threshold, not validated**. Calibrate against your own authorized and unknown test samples.
+The lock includes development and tracking dependencies and was resolved for
+Python 3.11. If your distribution lacks Python 3.11, use an approved version
+manager. Windows users can create the environment with `py -3.11 -m venv .venv`
+and activate `.venv\Scripts\Activate.ps1` before running the Python commands.
 
-## Data
-- `.local/gallery.npz`: biometric embeddings, unencrypted.
-- `.local/events.db`: local event metadata, unencrypted.
-- `.local/crops/`: JPEG crops of unfamiliar faces, unencrypted.
-- Delete `.local/` to erase local Sprint 1 data (verify backups separately).
+Automated tests require **no camera, model weights, graphical display, or real
+biometric data**. They use synthetic arrays and mocked camera/inference boundaries.
 
-## Important MVP limitations
-- Supports **one face at a time**. Multiple faces result in unresolved; Sprint 2 needs person tracking and per-track decision windows.
-- Repeated observations are not independent; the decision logic is illustrative, not statistically calibrated.
-- No liveness detection, anti-spoofing, privacy masking, disk encryption, secure retention automation, or production authentication.
-- Does not reliably detect persons whose faces are hidden; it is face-first, not full person detection.
-- No camera auto-reconnect beyond frame-read retry. Reopen/recovery is a Sprint 2 task.
-- Event cooldown is global, not per person. Avoid using this for actual security decisions.
-- The capture pipeline is synchronous and CPU-only; actual FPS depends on hardware.
-- The current event crop is drawn from the annotated frame, so it may contain the bounding-box overlay; a production version must crop the original frame before annotation.
+InsightFace's augmentation dependencies install `opencv-python-headless` alongside
+`opencv-python`. Both distributions share the `cv2` namespace. The lock pins both
+to 4.10.0.84. For an interactive desktop preview, install the GUI build last:
 
-## Acceptance checks
-1. `python -m pytest -q` passes all tests.
-2. Enrollment requires one sharp face and saves exactly 5 embeddings.
-3. Enrolled person remains familiar under tested lighting.
-4. Non-enrolled consenting test subject produces unfamiliar event and JPEG crop.
-5. Low-quality or multiple-face frames show unresolved.
-6. `security-ai events` lists UTC timestamps and image paths.
-7. Disconnect/reconnect and multi-hour stability are **manual experiments**, not guaranteed behavior in this MVP.
+```bash
+python -m pip install --force-reinstall --no-deps opencv-python==4.10.0.84
+```
 
-## Suggested next work
-Track faces per person, implement frame buffering and reconnection, tune thresholds with labeled data, encrypt stored templates, and add a durable event outbox before mobile notifications.
+A working local desktop display is still required for GUI enrollment/preview.
+Cloud validation uses headless tests and does not call GUI functions.
+
+## Local model provisioning
+
+The application never downloads weights automatically. Review model provenance,
+license, and checksums before provisioning:
+
+- YOLO: a **static batch-1 float32 raw COCO YOLOv8 or YOLO11 ONNX export**, with
+  `[1,3,H,W]` input and `[1,84,N]` or `[1,N,84]` output. COCO class 0 is person.
+  YOLOv5, custom class sets, segmentation, dynamic shapes, and exports with built-in
+  NMS are unsupported. Choose an appropriately licensed model/export, for example
+  a small model for CPU evaluation. Ultralytics model licensing may require AGPL
+  compliance or a commercial license; this repository's MIT license does not
+  grant rights to third-party model weights.
+- InsightFace: provision licensed `buffalo_l` detection and recognition `.onnx`
+  files beneath `<face-root>/models/buffalo_l/`. Its pretrained model terms can
+  restrict use to non-commercial research. The runtime enables detection and
+  recognition only and fingerprints the recognition file for gallery compatibility.
+
+Store weights outside Git, preferably outside the checkout. No detector accuracy
+or target-device throughput is claimed by the synthetic tests.
+
+## Enroll and monitor on your own device
+
+Only enroll consenting people. Enrollment is interactive and rejects inconsistent
+or near-duplicate samples; vary lighting and pose without changing the subject.
+
+```bash
+security-ai --data-dir /private/security-ai enroll \
+  --name alice --samples 5 --face-model-root /private/face-models
+
+security-ai --data-dir /private/security-ai monitor \
+  --person-model /private/models/yolo.onnx \
+  --person-sha256 YOUR_VERIFIED_SHA256 \
+  --face-model-root /private/face-models --metrics
+
+security-ai --data-dir /private/security-ai events
+```
+
+Use `--replace` to replace an existing profile explicitly. Sprint 1 galleries lack
+model fingerprints: archive them securely and enroll into a new private data
+directory. Do not silently label old embeddings with the current model hash.
+
+For local headless monitoring, add `--headless`; stop with Ctrl+C. A camera is
+required for live monitoring, never for tests. `--max-frames 300` limits successful
+processed frames; it is not a wall-clock timeout. Use `monitor --help` for controls.
+
+The default recognition threshold **0.45**, ambiguity margin **0.05**, enrollment
+consistency **0.6**, and duplicate threshold **0.995** are illustrative and
+uncalibrated. Evaluate enrollment-independent samples for your device and risk
+requirements. See [Sprint 2 testing and review guide](docs/SPRINT2.md).
+
+## Data and limitations
+
+- Templates, crops, and SQLite metadata remain **unencrypted**. Use device/disk
+  encryption, a trusted account, and protected backups. Local permissions are
+  enforced where the OS supports Unix modes.
+- Default event retention is 7 days and 10,000 events, enforced at startup and
+  every 300 processed frames. These are periodic limits, not a hard disk quota.
+  Missing crops and interrupted writes are reconciled at the same points.
+- Tracks are geometric continuity, not authenticated identities. Occlusion,
+  crossings, pose, masks, and crowded scenes can fragment or switch tracks.
+- No liveness or anti-spoofing protection. Recognition is not an access-control
+  guarantee. Repeated frames are not independent biometric evidence.
+- Capture uses a latest-frame buffer, bounded reconnect attempts, and expiring
+  evidence. Native driver reads can still block; shutdown reports a timeout.
+- Frames skipped by recognition scheduling produce unresolved current decisions;
+  old recognition results never generate new events without new evidence.
+- Model execution and storage are synchronous in the processing consumer; capture
+  continues independently. Device benchmarks and sustained hardware testing remain
+  required. No Firebase, Android, server, or remote application networking is added.
+
+Never commit embeddings, crops, databases, weights, credentials, or captured video.
+Git ignore patterns are defense in depth and do not replace reviewing staged files.

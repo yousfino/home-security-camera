@@ -41,3 +41,12 @@ def test_two_people_and_ambiguous_faces():
     assert associate_faces(tracks, [face(10), face(20)]) == {}
     overlap = [PersonTrack(1, (0, 0, 100, 200), 0.9), PersonTrack(2, (0, 0, 100, 200), 0.9)]
     assert associate_faces(overlap, [face(10)]) == {}
+
+
+def test_ambiguous_face_blocks_other_face_in_same_person():
+    tracks = [PersonTrack(1, (0, 0, 200, 200), 0.9), PersonTrack(2, (100, 0, 300, 200), 0.9)]
+    faces = [
+        SimpleNamespace(bbox=np.array([120, 10, 150, 40])),
+        SimpleNamespace(bbox=np.array([10, 10, 40, 40])),
+    ]
+    assert associate_faces(tracks, faces) == {}

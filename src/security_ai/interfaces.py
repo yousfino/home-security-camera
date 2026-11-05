@@ -12,7 +12,8 @@ class Capture(Protocol):
 
 
 class FaceAnalyzer(Protocol):
-    def get(self, frame: np.ndarray) -> list[Any]: ...
+    def detect(self, frame: np.ndarray) -> list[Any]: ...
+    def embed(self, frame: np.ndarray, face: Any) -> np.ndarray: ...
 
 
 class Display(Protocol):

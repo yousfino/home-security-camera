@@ -13,10 +13,11 @@ dependencies = [
   "insightface==0.7.3",
   "pydantic==2.10.6",
   "Pillow==11.1.0",
+  "supervision==0.25.1",
+  "opencv-python-headless==4.10.0.84",
 ]
 
 [project.optional-dependencies]
-tracking = ["supervision==0.25.1", "opencv-python-headless==4.11.0.86"]
 dev = ["pytest==8.3.4", "ruff==0.9.7"]
 
 [project.scripts]

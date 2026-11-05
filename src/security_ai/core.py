@@ -86,6 +86,8 @@ class GalleryIndex:
             if not samples:
                 raise ValueError(f"Empty profile: {name}")
             for sample in samples:
+                if np.asarray(sample).ndim != 1:
+                    raise ValueError("Gallery samples must be one-dimensional embeddings")
                 vector = normalized(sample)
                 dimension = dimension or vector.size
                 if vector.size != dimension:

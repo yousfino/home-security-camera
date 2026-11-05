@@ -86,6 +86,7 @@ def associate_faces(tracks: list[PersonTrack], faces: list[object]) -> dict[int,
     Tracking is geometric continuity, never proof of biometric identity.
     """
     candidates: dict[int, int] = {}
+    contained: dict[int, int] = {}
     for index, face in enumerate(faces):
         x1, y1, x2, y2 = map(float, face.bbox)
         area = (x2 - x1) * (y2 - y1)
@@ -97,7 +98,12 @@ def associate_faces(tracks: list[PersonTrack], faces: list[object]) -> dict[int,
             intersection = max(0.0, min(x2, c) - max(x1, a)) * max(0.0, min(y2, d) - max(y1, b))
             if intersection / area >= 0.9:
                 matches.append(track.track_id)
+                contained[track.track_id] = contained.get(track.track_id, 0) + 1
         if len(matches) == 1:
             candidates[index] = matches[0]
     values = list(candidates.values())
-    return {i: track_id for i, track_id in candidates.items() if values.count(track_id) == 1}
+    return {
+        i: track_id
+        for i, track_id in candidates.items()
+        if values.count(track_id) == 1 and contained[track_id] == 1
+    }

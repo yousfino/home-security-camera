@@ -1,2 +1,0 @@
-[console_scripts]
-security-ai = security_ai.cli:main
