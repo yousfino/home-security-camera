@@ -73,3 +73,36 @@ class DecisionWindow:
 
     def clear(self) -> None:
         self.observations.clear()
+
+
+class GalleryIndex:
+    """Validate and normalize once, then vectorize cosine matching."""
+
+    def __init__(self, gallery: dict[str, list[np.ndarray]]) -> None:
+        self.names: list[str] = []
+        rows = []
+        dimension = None
+        for name, samples in gallery.items():
+            if not samples:
+                raise ValueError(f"Empty profile: {name}")
+            for sample in samples:
+                vector = normalized(sample)
+                dimension = dimension or vector.size
+                if vector.size != dimension:
+                    raise ValueError("Gallery embedding dimensions differ")
+                rows.append(vector)
+                self.names.append(name)
+        self.matrix = np.stack(rows) if rows else np.empty((0, 0), dtype=np.float32)
+
+    def match(self, embedding: np.ndarray) -> tuple[str | None, float, float]:
+        query = normalized(embedding)
+        if not self.names:
+            return None, -1.0, -1.0
+        if query.size != self.matrix.shape[1]:
+            raise ValueError("Embedding/model dimension mismatch")
+        scores = np.clip(self.matrix @ query, -1, 1)
+        per_identity: dict[str, float] = {}
+        for name, score in zip(self.names, scores):
+            per_identity[name] = max(per_identity.get(name, -1.0), float(score))
+        ranked = sorted(per_identity.items(), key=lambda item: item[1], reverse=True)
+        return ranked[0][0], ranked[0][1], ranked[1][1] if len(ranked) > 1 else -1.0
