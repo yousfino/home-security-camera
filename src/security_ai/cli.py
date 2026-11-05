@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import time
 import logging
+import json
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 from pathlib import Path
@@ -138,13 +139,18 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
     display = HeadlessDisplay() if args.headless else OpenCVDisplay("Home Security Camera")
     frames = 0
     generation = None
+    runtime_start = time.monotonic()
     try:
         while args.max_frames is None or frames < args.max_frames:
+            max_runtime = getattr(args, "max_runtime", None)
+            if max_runtime is not None and time.monotonic() - runtime_start >= max_runtime:
+                break
             packet = cap.read()
             if packet is None:
                 if not args.headless and cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                     break
                 continue
+            frames += 1
             if packet.generation != generation:
                 pipeline.reset()
                 generation = packet.generation
@@ -198,7 +204,6 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
                     (255, 255, 255),
                     1,
                 )
-            frames += 1
             if frames % 300 == 0:
                 try:
                     maintain_events(db_path, crops, args.retention_days, args.max_events)
@@ -292,16 +297,42 @@ def main() -> None:
             p.add_argument("--headless", action="store_true")
             p.add_argument("--metrics", action="store_true")
             p.add_argument("--recognition-interval", type=finite_float, default=0.2)
-            p.add_argument("--max-frames", type=positive_int)
+            p.add_argument(
+                "--max-frames",
+                type=positive_int,
+                help="Maximum acquired frames, including stale frames",
+            )
+            p.add_argument(
+                "--max-runtime",
+                type=finite_float,
+                help="Maximum elapsed seconds, including outages",
+            )
             p.add_argument("--retention-days", type=finite_float, default=7.0)
             p.add_argument("--max-events", type=positive_int, default=10000)
     sub.add_parser("events")
+    p = sub.add_parser("doctor", help="Offline runtime diagnostics; no camera required")
+    p.add_argument("--check-models", action="store_true")
+    p.add_argument("--person-model", type=Path)
+    p.add_argument("--person-sha256")
+    p.add_argument("--face-model-root", type=Path)
     args = parser.parse_args()
     try:
+        if args.command == "doctor":
+            from .diagnostics import diagnose
+
+            report = diagnose(
+                args.person_model, args.face_model_root, args.person_sha256, args.check_models
+            )
+            print(json.dumps(report, sort_keys=True))
+            if not report["ready"]:
+                parser.exit(1)
+            return
         if args.command in ("monitor", "enroll") and args.max_frame_age <= 0:
             raise ValueError("Maximum frame age must be positive")
         if args.command == "monitor":
             recognition_config(args)
+            if args.max_runtime is not None and args.max_runtime <= 0:
+                raise ValueError("Maximum runtime must be positive")
             if args.retention_days <= 0:
                 raise ValueError("Retention days must be positive")
             if args.track_max_age <= 0 or not 0 < args.person_confidence <= 1:
