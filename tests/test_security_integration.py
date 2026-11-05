@@ -45,7 +45,7 @@ def test_migrate_legacy_events_and_private_permissions(tmp_path):
         model_id="model",
     )
     with sqlite3.connect(db) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
         row = conn.execute(
             "SELECT track_id,session_id,image_path FROM events WHERE id=?", (event_id,)
         ).fetchone()

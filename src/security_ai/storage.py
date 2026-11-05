@@ -159,7 +159,7 @@ def database(path: Path) -> Iterator[sqlite3.Connection]:
 def init_db(path: Path) -> None:
     with file_lock(path), database(path) as db:
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 2:
+        if version > 3:
             raise ValueError("Unsupported events schema")
         db.execute("""CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,11 +170,23 @@ def init_db(path: Path) -> None:
             image_path TEXT
         )""")
         columns = {row[1] for row in db.execute("PRAGMA table_info(events)")}
-        for name, kind in [("track_id", "INTEGER"), ("session_id", "TEXT"), ("model_id", "TEXT")]:
+        for name, kind in [
+            ("track_id", "INTEGER"),
+            ("session_id", "TEXT"),
+            ("model_id", "TEXT"),
+            ("episode_id", "TEXT"),
+            ("event_key", "TEXT"),
+        ]:
             if name not in columns:
                 db.execute(f"ALTER TABLE events ADD COLUMN {name} {kind}")
         db.execute("CREATE INDEX IF NOT EXISTS events_captured_at ON events(captured_at)")
-        db.execute("PRAGMA user_version=2")
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS event_key_unique ON events(event_key) WHERE event_key IS NOT NULL"
+        )
+        db.execute("""CREATE TABLE IF NOT EXISTS episodes (
+            episode_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+            started_at TEXT NOT NULL, last_seen TEXT NOT NULL, state TEXT NOT NULL)""")
+        db.execute("PRAGMA user_version=3")
 
 
 def save_event(
@@ -189,6 +201,8 @@ def save_event(
     session_id: str | None = None,
     model_id: str | None = None,
     captured_at: datetime | None = None,
+    episode_id: str | None = None,
+    event_key: str | None = None,
 ) -> int:
     if (
         status not in ("familiar", "unfamiliar", "unresolved")
@@ -207,6 +221,16 @@ def save_event(
     staged: Path | None = None
     final: Path | None = None
     with file_lock(db_path):
+        if event_key is not None:
+            with database(db_path) as db:
+                row = db.execute(
+                    "SELECT id,status,profile_name,episode_id FROM events WHERE event_key=?",
+                    (event_key,),
+                ).fetchone()
+                if row is not None:
+                    if row[1:] != (status, name, episode_id):
+                        raise ValueError("Event key was reused with different event data")
+                    return int(row[0])
         try:
             if crop is not None and crop.size:
                 ok, encoded = cv2.imencode(".jpg", crop)
@@ -223,7 +247,7 @@ def save_event(
             with database(db_path) as db:
                 cursor = db.execute(
                     "INSERT INTO events(captured_at,status,profile_name,similarity,image_path,"
-                    "track_id,session_id,model_id) VALUES (?,?,?,?,?,?,?,?)",
+                    "track_id,session_id,model_id,episode_id,event_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (
                         captured.astimezone(timezone.utc).isoformat(),
                         status,
@@ -233,6 +257,8 @@ def save_event(
                         track_id,
                         session_id,
                         model_id,
+                        episode_id,
+                        event_key,
                     ),
                 )
                 event_id = int(cursor.lastrowid)
@@ -294,3 +320,25 @@ def maintain_events(
                 generated or path.name.startswith(".pending-")
             ) and path.resolve() not in referenced:
                 path.unlink(missing_ok=True)
+
+
+def save_episodes(
+    db_path: Path, episodes: list, session_id: str, wall_start: datetime, monotonic_start: float
+) -> None:
+    if not episodes:
+        return
+    with file_lock(db_path), database(db_path) as db:
+        for episode in episodes:
+            started = wall_start + timedelta(seconds=episode.started - monotonic_start)
+            seen = wall_start + timedelta(seconds=episode.last_seen - monotonic_start)
+            db.execute(
+                "INSERT INTO episodes VALUES (?,?,?,?,?) ON CONFLICT(episode_id) "
+                "DO UPDATE SET last_seen=excluded.last_seen,state=excluded.state",
+                (
+                    episode.episode_id,
+                    session_id,
+                    started.isoformat(),
+                    seen.isoformat(),
+                    episode.state,
+                ),
+            )

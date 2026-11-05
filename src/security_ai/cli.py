@@ -21,6 +21,7 @@ from .quality import QualityConfig
 from .detection import YoloPersonDetector
 from .display import HeadlessDisplay, OpenCVDisplay
 from .pipeline import RecognitionPipeline
+from .episodes import EpisodeManager
 from .storage import (
     data_paths,
     init_db,
@@ -29,6 +30,7 @@ from .storage import (
     save_profile,
     maintain_events,
     safe_profile_name,
+    save_episodes,
 )
 from .tracking import PersonTracker
 from .vision import create_analyzer, crop_face, quality_ok
@@ -133,6 +135,9 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
     pipeline.quality = lambda frame, face: quality_ok(frame, face, quality_config(args))
     init_db(db_path)
     maintain_events(db_path, crops, args.retention_days, args.max_events)
+    episodes = EpisodeManager(
+        getattr(args, "episode_gap", 2.0), getattr(args, "reacquire_iou", 0.3)
+    )
     session_id = uuid4().hex
     wall_start, monotonic_start = datetime.now(timezone.utc), time.monotonic()
     cap = LatestFrameCapture(
@@ -156,6 +161,7 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
             if packet.generation != generation:
                 pipeline.reset()
                 generation = packet.generation
+                episodes.close()
             frame, timestamp = packet.image, packet.acquired_at
             if time.monotonic() - timestamp > args.max_frame_age:
                 pipeline.reset()
@@ -165,6 +171,13 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
                 # Slow inference must not emit an event for stale evidence.
                 pipeline.reset()
                 continue
+            decisions = episodes.update(decisions, timestamp)
+            try:
+                save_episodes(db_path, episodes.pending(), session_id, wall_start, monotonic_start)
+            except (OSError, sqlite3.Error):
+                logging.error("Episode checkpoint failed")
+            else:
+                episodes.checkpointed()
             for decision in decisions:
                 if decision.emit:
                     crop = (
@@ -181,12 +194,15 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
                             track_id=decision.track_id,
                             session_id=session_id,
                             model_id=model.fingerprint,
+                            episode_id=decision.episode_id,
+                            event_key=decision.event_key,
                             captured_at=wall_start + timedelta(seconds=timestamp - monotonic_start),
                         )
                     except (OSError, sqlite3.Error, RuntimeError, cv2.error):
                         logging.exception("Event persistence failed; cooldown was not advanced")
                     else:
                         pipeline.acknowledge(decision, timestamp)
+                        episodes.acknowledge(decision)
             preview = frame.copy()
             for decision in decisions:
                 x1, y1, x2, y2 = map(int, decision.box)
@@ -227,6 +243,11 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
             cap.close()
         finally:
             display.close()
+            episodes.close()
+            try:
+                save_episodes(db_path, episodes.pending(), session_id, wall_start, monotonic_start)
+            except (OSError, sqlite3.Error):
+                logging.error("Final episode checkpoint failed")
 
 
 def list_events(db_path: Path) -> None:
@@ -302,6 +323,8 @@ def main() -> None:
                 help="Keep low-score detections for ByteTrack second-stage association",
             )
             p.add_argument("--track-max-age", type=finite_float, default=2.0)
+            p.add_argument("--episode-gap", type=finite_float, default=2.0)
+            p.add_argument("--reacquire-iou", type=finite_float, default=0.3)
             p.add_argument(
                 "--threshold",
                 type=finite_float,
@@ -367,6 +390,7 @@ def main() -> None:
             raise ValueError("Maximum frame age must be positive")
         if args.command == "monitor":
             recognition_config(args)
+            EpisodeManager(args.episode_gap, args.reacquire_iou)
             if args.max_runtime is not None and args.max_runtime <= 0:
                 raise ValueError("Maximum runtime must be positive")
             if args.retention_days <= 0:

@@ -24,6 +24,8 @@ class TrackDecision:
     score: float = -1.0
     face: Any = None
     emit: bool = False
+    episode_id: str | None = None
+    event_key: str | None = None
 
 
 @dataclass
