@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Callable, Any
+import time
 import numpy as np
 
 from .config import RecognitionConfig
@@ -45,6 +46,7 @@ class RecognitionPipeline:
         self.detector, self.tracker, self.analyzer = detector, tracker, analyzer
         self.gallery, self.config, self.quality = GalleryIndex(gallery), config, quality
         self.states: dict[int, TrackState] = {}
+        self.timings: dict[str, float] = {}
 
     def reset(self) -> None:
         self.tracker.reset()
@@ -57,13 +59,18 @@ class RecognitionPipeline:
             state.logged[(decision.status, decision.name)] = timestamp
 
     def process(self, frame: np.ndarray, timestamp: float) -> list[TrackDecision]:
-        tracks = self.tracker.update(self.detector.detect(frame), timestamp)
+        started = time.perf_counter()
+        detections = self.detector.detect(frame)
+        detected = time.perf_counter()
+        tracks = self.tracker.update(detections, timestamp)
+        tracked = time.perf_counter()
         self.states = {
             key: state
             for key, state in self.states.items()
             if timestamp - state.last_seen <= self.tracker.max_age
         }
         faces = self.analyzer.detect(frame) if tracks else []
+        faces_detected = time.perf_counter()
         associations = associate_faces(tracks, faces)
         by_track = {track_id: faces[i] for i, track_id in associations.items()}
         results = []
@@ -81,6 +88,13 @@ class RecognitionPipeline:
                 state.window.clear()
             status, name, score = "unresolved", None, -1.0
             if face is not None and self.quality(frame, face):
+                if (
+                    state.last_evidence is not None
+                    and timestamp - state.last_evidence < self.config.recognition_interval
+                ):
+                    # No new identity observation or event on skipped inference.
+                    results.append(TrackDecision(track.track_id, track.box, face=face))
+                    continue
                 embedding = self.analyzer.embed(frame, face)
                 name, score, runner_up = self.gallery.match(embedding)
                 status = classify(name, score, self.config.threshold, True)
@@ -98,4 +112,12 @@ class RecognitionPipeline:
             results.append(
                 TrackDecision(track.track_id, track.box, label, stable_name, score, face, emit)
             )
+        finished = time.perf_counter()
+        self.timings = {
+            "person_ms": (detected - started) * 1000,
+            "tracking_ms": (tracked - detected) * 1000,
+            "face_detection_ms": (faces_detected - tracked) * 1000,
+            "recognition_ms": (finished - faces_detected) * 1000,
+            "total_ms": (finished - started) * 1000,
+        }
         return results
