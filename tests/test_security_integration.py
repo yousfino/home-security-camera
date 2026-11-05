@@ -165,6 +165,7 @@ def test_monitor_end_to_end_without_camera_models_or_gui(tmp_path, monkeypatch):
 
     gallery, db, crops = data_paths(tmp_path / "private")
     save_gallery(gallery, {"alice": [np.array([1.0, 0.0])]}, model_id="test")
+    monkeypatch.setattr(cli, "quality_ok", lambda *_: True)
     model = Analyzer()
     model.fingerprint = "test"
     monkeypatch.setattr(cli, "create_analyzer", lambda *_: model)
@@ -227,6 +228,7 @@ def test_monitor_retries_failed_event_write(tmp_path, monkeypatch):
 
     gallery, db, crops = data_paths(tmp_path / "private")
     save_gallery(gallery, {"alice": [np.array([1.0, 0.0])]}, model_id="test")
+    monkeypatch.setattr(cli, "quality_ok", lambda *_: True)
     model = Analyzer()
     model.fingerprint = "test"
     monkeypatch.setattr(cli, "create_analyzer", lambda *_: model)
@@ -263,6 +265,7 @@ def test_reconnect_discards_old_identity_history(tmp_path, monkeypatch):
 
     gallery, db, crops = data_paths(tmp_path / "private")
     save_gallery(gallery, {"alice": [np.array([1.0, 0.0])]}, model_id="test")
+    monkeypatch.setattr(cli, "quality_ok", lambda *_: True)
     model = Analyzer()
     model.fingerprint = "test"
     monkeypatch.setattr(cli, "create_analyzer", lambda *_: model)

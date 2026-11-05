@@ -17,6 +17,7 @@ import numpy as np
 from .capture import LatestFrameCapture
 from .config import RecognitionConfig, positive_int, finite_float
 from .core import normalized
+from .quality import QualityConfig
 from .detection import YoloPersonDetector
 from .display import HeadlessDisplay, OpenCVDisplay
 from .pipeline import RecognitionPipeline
@@ -79,7 +80,7 @@ def enroll(args: argparse.Namespace, gallery_path: Path) -> None:
             if time.monotonic() - packet.acquired_at > args.max_frame_age:
                 continue
             faces = model.detect(frame)
-            ready = len(faces) == 1 and quality_ok(frame, faces[0])
+            ready = len(faces) == 1 and quality_ok(frame, faces[0], quality_config(args))
             preview = frame.copy()
             cv2.putText(
                 preview,
@@ -129,6 +130,7 @@ def monitor(args: argparse.Namespace, gallery_path: Path, db_path: Path, crops: 
     pipeline = RecognitionPipeline(
         detector, PersonTracker(args.track_max_age), model, gallery, recognition_config(args)
     )
+    pipeline.quality = lambda frame, face: quality_ok(frame, face, quality_config(args))
     init_db(db_path)
     maintain_events(db_path, crops, args.retention_days, args.max_events)
     session_id = uuid4().hex
@@ -242,11 +244,21 @@ def list_events(db_path: Path) -> None:
 def recognition_config(args: argparse.Namespace) -> RecognitionConfig:
     return RecognitionConfig(
         threshold=args.threshold,
+        aggregation=getattr(args, "gallery_aggregation", "max"),
         recognition_interval=args.recognition_interval,
         evidence_ttl=args.evidence_ttl,
         ambiguity_margin=args.ambiguity_margin,
         cooldown=args.cooldown,
         familiar_log_interval=args.familiar_log_interval,
+    )
+
+
+def quality_config(args: argparse.Namespace) -> QualityConfig:
+    return QualityConfig(
+        **{
+            name: getattr(args, name, field.default)
+            for name, field in QualityConfig.__dataclass_fields__.items()
+        }
     )
 
 
@@ -257,6 +269,12 @@ def main() -> None:
     for command in ("enroll", "monitor"):
         p = sub.add_parser(command)
         p.add_argument("--camera", type=int, default=0)
+        p.add_argument("--min-face-px", type=positive_int, default=80)
+        p.add_argument("--min-blur-variance", type=finite_float, default=55.0)
+        p.add_argument("--min-brightness", type=finite_float, default=35.0)
+        p.add_argument("--max-brightness", type=finite_float, default=220.0)
+        p.add_argument("--max-roll", type=finite_float, default=25.0)
+        p.add_argument("--max-yaw-asymmetry", type=finite_float, default=0.6)
         p.add_argument("--reconnect-attempts", type=positive_int, default=8)
         p.add_argument("--max-frame-age", type=finite_float, default=0.5)
         p.add_argument("--width", type=positive_int, default=640)
@@ -290,6 +308,7 @@ def main() -> None:
                 default=0.45,
                 help="Unvalidated cosine threshold; calibrate locally",
             )
+            p.add_argument("--gallery-aggregation", choices=("max", "mean"), default="max")
             p.add_argument("--ambiguity-margin", type=finite_float, default=0.05)
             p.add_argument("--evidence-ttl", type=finite_float, default=2.0)
             p.add_argument("--cooldown", type=finite_float, default=30.0)
@@ -315,8 +334,23 @@ def main() -> None:
     p.add_argument("--person-model", type=Path)
     p.add_argument("--person-sha256")
     p.add_argument("--face-model-root", type=Path)
+    p = sub.add_parser("calibrate", help="Evaluate local enrollment-independent pair scores")
+    p.add_argument("--scores", type=Path, required=True)
+    p.add_argument("--thresholds", type=finite_float, nargs="+", required=True)
+    p.add_argument("--max-fmr", type=finite_float, default=0.01)
+    p.add_argument(
+        "--enrollment-independent",
+        action="store_true",
+        required=True,
+        help="Attest evaluation samples were not used for enrollment",
+    )
     args = parser.parse_args()
     try:
+        if args.command == "calibrate":
+            from .calibration import evaluate, load_scores
+
+            print(json.dumps(evaluate(load_scores(args.scores), args.thresholds, args.max_fmr)))
+            return
         if args.command == "doctor":
             from .diagnostics import diagnose
 
@@ -327,6 +361,8 @@ def main() -> None:
             if not report["ready"]:
                 parser.exit(1)
             return
+        if args.command in ("monitor", "enroll"):
+            quality_config(args)
         if args.command in ("monitor", "enroll") and args.max_frame_age <= 0:
             raise ValueError("Maximum frame age must be positive")
         if args.command == "monitor":

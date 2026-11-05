@@ -23,6 +23,7 @@ def finite_float(value: str) -> float:
 @dataclass(frozen=True)
 class RecognitionConfig:
     threshold: float = 0.45
+    aggregation: str = "max"
     minimum: int = 3
     window: int = 5
     evidence_ttl: float = 2.0
@@ -32,6 +33,8 @@ class RecognitionConfig:
     familiar_log_interval: float = 60.0
 
     def __post_init__(self) -> None:
+        if self.aggregation not in ("max", "mean"):
+            raise ValueError("Aggregation must be max or mean")
         if not math.isfinite(self.threshold) or not -1 <= self.threshold <= 1:
             raise ValueError("Cosine threshold must be finite and in [-1, 1]")
         if not 1 <= self.minimum <= self.window:

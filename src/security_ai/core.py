@@ -78,7 +78,10 @@ class DecisionWindow:
 class GalleryIndex:
     """Validate and normalize once, then vectorize cosine matching."""
 
-    def __init__(self, gallery: dict[str, list[np.ndarray]]) -> None:
+    def __init__(self, gallery: dict[str, list[np.ndarray]], aggregation: str = "max") -> None:
+        if aggregation not in ("max", "mean"):
+            raise ValueError("Aggregation must be max or mean")
+        self.aggregation = aggregation
         self.names: list[str] = []
         rows = []
         dimension = None
@@ -103,8 +106,12 @@ class GalleryIndex:
         if query.size != self.matrix.shape[1]:
             raise ValueError("Embedding/model dimension mismatch")
         scores = np.clip(self.matrix @ query, -1, 1)
-        per_identity: dict[str, float] = {}
+        grouped: dict[str, list[float]] = {}
         for name, score in zip(self.names, scores):
-            per_identity[name] = max(per_identity.get(name, -1.0), float(score))
+            grouped.setdefault(name, []).append(float(score))
+        per_identity = {
+            name: max(values) if self.aggregation == "max" else float(np.mean(values))
+            for name, values in grouped.items()
+        }
         ranked = sorted(per_identity.items(), key=lambda item: item[1], reverse=True)
         return ranked[0][0], ranked[0][1], ranked[1][1] if len(ranked) > 1 else -1.0

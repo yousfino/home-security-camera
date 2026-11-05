@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import os
-import cv2
 import numpy as np
+from .quality import QualityConfig, assess_quality
 
 
 class LocalFaceAnalyzer:
@@ -78,13 +78,14 @@ def crop_face(frame: np.ndarray, face, margin: float = 0.15) -> np.ndarray:
 
 
 def quality_ok(
-    frame: np.ndarray, face, min_face_px: int = 80, min_blur_variance: float = 55.0
+    frame: np.ndarray,
+    face: object,
+    policy: QualityConfig | None = None,
+    min_face_px: int = 80,
+    min_blur_variance: float = 55.0,
 ) -> bool:
-    x1, y1, x2, y2 = face_box(face, frame)
-    if x2 - x1 < min_face_px or y2 - y1 < min_face_px:
-        return False
-    crop = frame[y1:y2, x1:x2]
-    if crop.size == 0:
-        return False
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var()) >= min_blur_variance
+    return assess_quality(
+        frame,
+        face,
+        policy or QualityConfig(min_face_px=min_face_px, min_blur_variance=min_blur_variance),
+    )

@@ -45,7 +45,11 @@ class RecognitionPipeline:
         quality: Callable[[np.ndarray, Any], bool] = quality_ok,
     ) -> None:
         self.detector, self.tracker, self.analyzer = detector, tracker, analyzer
-        self.gallery, self.config, self.quality = GalleryIndex(gallery), config, quality
+        self.gallery, self.config, self.quality = (
+            GalleryIndex(gallery, config.aggregation),
+            config,
+            quality,
+        )
         self.states: dict[int, TrackState] = {}
         self.timings: dict[str, float] = {}
 
