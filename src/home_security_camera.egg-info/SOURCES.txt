@@ -1,0 +1,17 @@
+LICENSE
+README.md
+pyproject.toml
+src/home_security_camera.egg-info/PKG-INFO
+src/home_security_camera.egg-info/SOURCES.txt
+src/home_security_camera.egg-info/dependency_links.txt
+src/home_security_camera.egg-info/entry_points.txt
+src/home_security_camera.egg-info/requires.txt
+src/home_security_camera.egg-info/top_level.txt
+src/security_ai/__init__.py
+src/security_ai/__main__.py
+src/security_ai/cli.py
+src/security_ai/core.py
+src/security_ai/storage.py
+src/security_ai/vision.py
+tests/test_core.py
+tests/test_storage.py

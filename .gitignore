@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+.env
+.local/
+models/
+*.onnx
+*.db
+*.db-shm
+*.db-wal
+run-project.txt
